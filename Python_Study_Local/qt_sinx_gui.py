@@ -7,7 +7,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -24,6 +26,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("信号与系统 - sin(x)")
+
+        self._defaults = {
+            "n_points": 100,
+            "discrete_step": 0.5,
+            "x_min": 0.0,
+            "x_max": float(2 * np.pi),
+            "y_min": -1.2,
+            "y_max": 1.2,
+        }
 
         central = QWidget(self)
         main_layout = QHBoxLayout(central)
@@ -76,7 +87,7 @@ class MainWindow(QMainWindow):
 
         self.n_points = QSpinBox()
         self.n_points.setRange(10, 5000)
-        self.n_points.setValue(100)
+        self.n_points.setValue(self._defaults["n_points"])
         self.n_points.setSingleStep(50)
         form.addRow("连续点数 N:", self.n_points)
 
@@ -84,7 +95,7 @@ class MainWindow(QMainWindow):
         self.discrete_step.setRange(0.01, 2.0)
         self.discrete_step.setDecimals(2)
         self.discrete_step.setSingleStep(0.05)
-        self.discrete_step.setValue(0.5)
+        self.discrete_step.setValue(self._defaults["discrete_step"])
         form.addRow("离散步长 Δx:", self.discrete_step)
 
         # 定义域范围（x 轴）
@@ -92,14 +103,14 @@ class MainWindow(QMainWindow):
         self.x_min.setRange(-1000.0, 1000.0)
         self.x_min.setDecimals(3)
         self.x_min.setSingleStep(0.5)
-        self.x_min.setValue(0.0)
+        self.x_min.setValue(self._defaults["x_min"])
         form.addRow("x_min:", self.x_min)
 
         self.x_max = QDoubleSpinBox()
         self.x_max.setRange(-1000.0, 1000.0)
         self.x_max.setDecimals(3)
         self.x_max.setSingleStep(0.5)
-        self.x_max.setValue(float(2 * np.pi))
+        self.x_max.setValue(self._defaults["x_max"])
         form.addRow("x_max:", self.x_max)
 
         # 值域范围（y 轴）
@@ -107,18 +118,31 @@ class MainWindow(QMainWindow):
         self.y_min.setRange(-1000.0, 1000.0)
         self.y_min.setDecimals(3)
         self.y_min.setSingleStep(0.1)
-        self.y_min.setValue(-1.2)
+        self.y_min.setValue(self._defaults["y_min"])
         form.addRow("y_min:", self.y_min)
 
         self.y_max = QDoubleSpinBox()
         self.y_max.setRange(-1000.0, 1000.0)
         self.y_max.setDecimals(3)
         self.y_max.setSingleStep(0.1)
-        self.y_max.setValue(1.2)
+        self.y_max.setValue(self._defaults["y_max"])
         form.addRow("y_max:", self.y_max)
 
+        buttons = QWidget(left_panel)
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+
         self.update_btn = QPushButton("更新绘图")
-        left_layout.addWidget(self.update_btn)
+        self.reset_btn = QPushButton("重置参数")
+        buttons_layout.addWidget(self.update_btn)
+        buttons_layout.addWidget(self.reset_btn)
+        left_layout.addWidget(buttons)
+
+        left_layout.addWidget(QLabel("信息显示："))
+        self.info_box = QPlainTextEdit()
+        self.info_box.setReadOnly(True)
+        self.info_box.setMinimumHeight(140)
+        left_layout.addWidget(self.info_box)
         left_layout.addStretch(1)
 
         plot_layout.addWidget(self.canvas)
@@ -127,6 +151,7 @@ class MainWindow(QMainWindow):
         self._plot()
 
         self.update_btn.clicked.connect(self._plot)
+        self.reset_btn.clicked.connect(self._reset_defaults)
         self.n_points.valueChanged.connect(self._plot)
         self.discrete_step.valueChanged.connect(self._plot)
         self.x_min.valueChanged.connect(self._plot)
@@ -134,7 +159,33 @@ class MainWindow(QMainWindow):
         self.y_min.valueChanged.connect(self._plot)
         self.y_max.valueChanged.connect(self._plot)
 
-        self.statusBar().showMessage("就绪：修改参数可实时更新")
+        self._set_info("就绪：修改参数可实时更新")
+
+    def _set_info(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        if hasattr(self, "info_box") and self.info_box is not None:
+            self.info_box.setPlainText(message)
+
+    def _reset_defaults(self) -> None:
+        widgets = [
+            (self.n_points, self._defaults["n_points"]),
+            (self.discrete_step, self._defaults["discrete_step"]),
+            (self.x_min, self._defaults["x_min"]),
+            (self.x_max, self._defaults["x_max"]),
+            (self.y_min, self._defaults["y_min"]),
+            (self.y_max, self._defaults["y_max"]),
+        ]
+
+        for w, _ in widgets:
+            w.blockSignals(True)
+        try:
+            for w, v in widgets:
+                w.setValue(v)
+        finally:
+            for w, _ in widgets:
+                w.blockSignals(False)
+
+        self._plot()
 
     def _plot(self) -> None:
         n = int(self.n_points.value())
@@ -145,10 +196,10 @@ class MainWindow(QMainWindow):
         y_max = float(self.y_max.value())
 
         if x_min >= x_max:
-            self.statusBar().showMessage("范围无效：需要 x_min < x_max")
+            self._set_info("范围无效：需要 x_min < x_max")
             return
         if y_min >= y_max:
-            self.statusBar().showMessage("范围无效：需要 y_min < y_max")
+            self._set_info("范围无效：需要 y_min < y_max")
             return
 
         self.ax1.clear()
@@ -157,6 +208,12 @@ class MainWindow(QMainWindow):
         # 连续信号
         x = np.linspace(x_min, x_max, n)
         y = np.sin(x)
+        y_cont_min = float(np.min(y))
+        y_cont_max = float(np.max(y))
+        idx_cont_max = int(np.argmax(y))
+        idx_cont_min = int(np.argmin(y))
+        x_cont_at_max = float(x[idx_cont_max])
+        x_cont_at_min = float(x[idx_cont_min])
         self.ax1.plot(x, y, label="sin(x)")
         self.ax1.set_title("y = sin(x) (Continuous)")
         self.ax1.set_xlabel("x")
@@ -169,9 +226,17 @@ class MainWindow(QMainWindow):
         # 离散信号
         x_discrete = np.arange(x_min, x_max, step)
         if x_discrete.size == 0:
-            self.statusBar().showMessage("离散点为空：请减小 Δx 或增大 x 范围")
+            self._set_info("离散点为空：请减小 Δx 或增大 x 范围")
             return
         y_discrete = np.sin(x_discrete)
+        y_disc_min = float(np.min(y_discrete))
+        y_disc_max = float(np.max(y_discrete))
+        idx_disc_max = int(np.argmax(y_discrete))
+        idx_disc_min = int(np.argmin(y_discrete))
+        x_disc_at_max = float(x_discrete[idx_disc_max])
+        x_disc_at_min = float(x_discrete[idx_disc_min])
+        x_disc_first = float(x_discrete[0])
+        x_disc_last = float(x_discrete[-1])
         markerline, stemlines, baseline = self.ax2.stem(
             x_discrete,
             y_discrete,
@@ -191,8 +256,19 @@ class MainWindow(QMainWindow):
         self.ax2.legend()
 
         self.canvas.draw_idle()
-        self.statusBar().showMessage(
-            f"已更新：N={n}, Δx={step:.2f}, x=[{x_min:.2f},{x_max:.2f}], y=[{y_min:.2f},{y_max:.2f}]"
+        self._set_info(
+            "已更新\n"
+            f"- 连续点数 N = {n}\n"
+            f"- 离散步长 Δx = {step:.2f}（离散点数 {x_discrete.size}）\n"
+            f"- x 范围(显示) = [{x_min:.3f}, {x_max:.3f}]\n"
+            f"- y 范围(显示) = [{y_min:.3f}, {y_max:.3f}]\n"
+            f"- 连续 y 实际范围 = [{y_cont_min:.6f}, {y_cont_max:.6f}]\n"
+            f"  - 连续峰值点 ≈ (x={x_cont_at_max:.6f}, y={y_cont_max:.6f})\n"
+            f"  - 连续谷值点 ≈ (x={x_cont_at_min:.6f}, y={y_cont_min:.6f})\n"
+            f"- 离散 y 实际范围 = [{y_disc_min:.6f}, {y_disc_max:.6f}]\n"
+            f"  - 离散峰值点 = (x={x_disc_at_max:.6f}, y={y_disc_max:.6f})\n"
+            f"  - 离散谷值点 = (x={x_disc_at_min:.6f}, y={y_disc_min:.6f})\n"
+            f"- 离散 x 覆盖 = [{x_disc_first:.3f}, {x_disc_last:.3f}]"
         )
 
 
