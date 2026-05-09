@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>实时声音男女识别</title>
+    <!-- 引入Chart.js（可视化） -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .container {
+            width: 80%;
+            margin: 0 auto;
+            text-align: center;
+        }
+
+        .result {
+            font-size: 24px;
+            margin: 20px 0;
+            color: #2c3e50;
+        }
+
+        .confidence {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .chart-container {
+            height: 300px;
+            margin: 20px 0;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 18px;
+            margin: 0 10px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>实时声音男女识别</h1>
+        <button id="startBtn">开始采集</button>
+        <button id="stopBtn" disabled>停止采集</button>
+
+        <!-- 识别结果展示 -->
+        <div class="result">
+            识别结果：<span id="gender">未识别</span>
+            置信度：<span class="confidence" id="confidence">--</span>%
+        </div>
+
+        <!-- 幅度可视化（波形图） -->
+        <h3>实时声音幅度</h3>
+        <div class="chart-container">
+            <canvas id="amplitudeChart"></canvas>
+        </div>
+
+        <!-- 频率可视化（柱状图） -->
+        <h3>平均频率（Hz）</h3>
+        <div class="chart-container">
+            <canvas id="frequencyChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // 1. 初始化变量
+        let recorder = null;
+        let audioContext = null;
+        let captureTimer = null;
+        let isSending = false;
+        let activeStream = null;
+        let amplitudeChart = null;  // 幅度图表
+        let frequencyChart = null;  // 频率图表
+        let amplitudeData = [];     // 幅度数据
+        let frequencyData = [];     // 频率数据
+        const API_URL = "http://127.0.0.1:8000/predict_voice";  // 后端API地址
+
+        // 2. 初始化图表（页面加载完成后）
+        window.onload = function () {
+            // 幅度图表（折线图：实时展示幅度变化）
+            const ampCtx = document.getElementById("amplitudeChart").getContext("2d");
+            amplitudeChart = new Chart(ampCtx, {
+                type: "line",
+                data: {
+                    labels: [],  // X轴：时间（秒）
+                    datasets: [{
+                        label: "声音幅度",
+                        data: amplitudeData,
+                        borderColor: "#3498db",
+                        tension: 0.1,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: { y: { beginAtZero: true, title: { text: "幅度值", display: true } } }
+                }
+            });
+
+            // 频率图表（折线图：展示平均频率变化）
+            const freqCtx = document.getElementById("frequencyChart").getContext("2d");
+            frequencyChart = new Chart(freqCtx, {
+                type: "line",
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: "频率（Hz）",
+                        data: frequencyData,
+                        borderColor: "#2ecc71",
+                        tension: 0.1,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: { y: { beginAtZero: true, title: { text: "频率（Hz）", display: true } } }
+                }
+            });
+        };
+
+        // 3. 开始采集按钮事件
+        class SimpleRecorder {
+            constructor(context, numChannels = 1) {
+                this.context = context;
+                this.numChannels = numChannels;
+                this.source = null;
+                this.processor = null;
+                this.recording = false;
+                this.buffers = [];
+            }
+
+            async init(stream) {
+                this.source = this.context.createMediaStreamSource(stream);
+                this.processor = this.context.createScriptProcessor(4096, this.numChannels, this.numChannels);
+                this.buffers = Array.from({ length: this.numChannels }, () => []);
+                this.processor.onaudioprocess = (event) => {
+                    if (!this.recording) return;
+                    for (let ch = 0; ch < this.numChannels; ch += 1) {
+                        this.buffers[ch].push(new Float32Array(event.inputBuffer.getChannelData(ch)));
+                    }
+                };
+                this.source.connect(this.processor);
+                this.processor.connect(this.context.destination);
+            }
+
+            start() {
+                this.buffers = Array.from({ length: this.numChannels }, () => []);
+                this.recording = true;
+            }
+
+            stop() {
+                this.recording = false;
+                const buffer = this._mergeBuffers();
+                const wav = this._encodeWAV(buffer);
+                return { blob: new Blob([wav], { type: "audio/wav" }) };
+            }
+
+            _mergeBuffers() {
+                const merged = [];
+                for (let ch = 0; ch < this.numChannels; ch += 1) {
+                    const channelBuffer = this.buffers[ch];
+                    const length = channelBuffer.reduce((sum, buf) => sum + buf.length, 0);
+                    const result = new Float32Array(length);
+                    let offset = 0;
+                    for (const buf of channelBuffer) {
+                        result.set(buf, offset);
+                        offset += buf.length;
+                    }
+                    merged.push(result);
+                }
+
+                if (this.numChannels === 1) {
+                    return merged[0];
+                }
+
+                const interleaved = new Float32Array(merged[0].length * 2);
+                let index = 0;
+                for (let i = 0; i < merged[0].length; i += 1) {
+                    interleaved[index++] = merged[0][i];
+                    interleaved[index++] = merged[1][i];
+                }
+                return interleaved;
+            }
+
+            _encodeWAV(samples) {
+                const buffer = new ArrayBuffer(44 + samples.length * 2);
+                const view = new DataView(buffer);
+                const sampleRate = this.context.sampleRate;
+                const numChannels = this.numChannels;
+
+                const writeString = (offset, string) => {
+                    for (let i = 0; i < string.length; i += 1) {
+                        view.setUint8(offset + i, string.charCodeAt(i));
+                    }
+                };
+
+                const floatTo16BitPCM = (output, offset, input) => {
+                    for (let i = 0; i < input.length; i += 1, offset += 2) {
+                        let s = Math.max(-1, Math.min(1, input[i]));
+                        s = s < 0 ? s * 0x8000 : s * 0x7fff;
+                        output.setInt16(offset, s, true);
+                    }
+                };
+
+                writeString(0, "RIFF");
+                view.setUint32(4, 36 + samples.length * 2, true);
+                writeString(8, "WAVE");
+                writeString(12, "fmt ");
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, numChannels, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * numChannels * 2, true);
+                view.setUint16(32, numChannels * 2, true);
+                view.setUint16(34, 16, true);
+                writeString(36, "data");
+                view.setUint32(40, samples.length * 2, true);
+                floatTo16BitPCM(view, 44, samples);
+
+                return view;
+            }
+        }
+
+        document.getElementById("startBtn").addEventListener("click", async function () {
+            // 启用麦克风（WebRTC）
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            activeStream = stream;
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 22050 });
+            recorder = new SimpleRecorder(audioContext, 1);
+            await recorder.init(stream);
+            recorder.start();
+
+            // 切换按钮状态
+            this.disabled = true;
+            document.getElementById("stopBtn").disabled = false;
+
+            // 定时发送音频（每1秒发送一次，实时识别）
+            captureTimer = setInterval(async function () {
+                if (!recorder || isSending) return;
+                isSending = true;
+
+                // 停止当前片段录制，获取WAV文件
+                const result = recorder.stop();
+                recorder.start();  // 重新开始录制
+
+                const wavBlob = result.blob;
+
+                // 发送音频到后端API
+                const formData = new FormData();
+                formData.append("file", wavBlob, "audio.wav");
+                const response = await fetch(API_URL, {
+                    method: "POST",
+                    body: formData
+                });
+                const responseData = await response.json();
+
+                // 处理后端返回结果
+                if (responseData.status === "success") {
+                    // 更新识别结果
+                    document.getElementById("gender").textContent = responseData.gender;
+                    document.getElementById("confidence").textContent = responseData.confidence;
+
+                    // 更新幅度图表（添加最新幅度值）
+                    const amp = responseData.display_features.amplitude;
+                    amplitudeData.push(amp);
+                    amplitudeChart.data.labels.push(amplitudeData.length);  // X轴：第n秒
+                    amplitudeChart.data.datasets[0].data = amplitudeData;
+                    amplitudeChart.update();
+
+                    // 更新频率图表（显示最新平均频率）
+                    const freq = responseData.display_features.mean_frequency;
+                    frequencyData.push(freq);
+                    frequencyChart.data.labels.push(frequencyData.length);
+                    frequencyChart.data.datasets[0].data = frequencyData;
+                    frequencyChart.update();
+                } else {
+                    console.error("识别错误：", responseData.message);
+                }
+                isSending = false;
+            }, 1000);  // 每1秒处理一次
+        });
+
+        // 4. 停止采集按钮事件
+        document.getElementById("stopBtn").addEventListener("click", async function () {
+            if (captureTimer) {
+                clearInterval(captureTimer);
+                captureTimer = null;
+            }
+            if (recorder) {
+                recorder.stop();
+                recorder = null;
+            }
+            if (activeStream) {
+                activeStream.getTracks().forEach(track => track.stop());  // 关闭麦克风
+                activeStream = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            // 切换按钮状态
+            this.disabled = true;
+            document.getElementById("startBtn").disabled = false;
+        });
+    </script>
+</body>
+
+</html>

@@ -15,6 +15,11 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QVBoxLayout,
     QWidget,
+    QComboBox,
+    QCheckBox,
+    QGroupBox,
+    QRadioButton,
+    QButtonGroup,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -26,6 +31,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("信号与系统 - sin(x)")
+        self._ui_ready = False
 
         self._defaults = {
             "n_points": 100,
@@ -34,6 +40,8 @@ class MainWindow(QMainWindow):
             "x_max": float(2 * np.pi),
             "y_min": -1.2,
             "y_max": 1.2,
+            "function": "sin",
+            "show_sampling": False,
         }
 
         central = QWidget(self)
@@ -98,6 +106,40 @@ class MainWindow(QMainWindow):
         self.discrete_step.setValue(self._defaults["discrete_step"])
         form.addRow("离散步长 Δx:", self.discrete_step)
 
+        # 函数选择（正弦、余弦、冲激、阶跃）
+        self.function_select = QComboBox()
+        self.function_select.addItems(["sin(x)", "cos(x)", "impulse", "step"])
+        # 内部映射到关键字
+        self._function_map = {0: "sin", 1: "cos", 2: "impulse", 3: "step"}
+        form.addRow("函数类型:", self.function_select)
+
+        # 是否显示采样（离散点）
+        self.show_sampling = QCheckBox("显示采样（离散点）")
+        self.show_sampling.setChecked(self._defaults.get("show_sampling", False))
+        form.addRow(self.show_sampling)
+
+        # 新增：左侧函数切换栏目（单选按钮列） — 与上方的 function_select 保持同步
+        func_group = QGroupBox("函数切换")
+        func_group_layout = QVBoxLayout(func_group)
+        self._func_radio_buttons = []
+        labels = ["sin(x)", "cos(x)", "impulse", "step"]
+        self._radio_btn_group = QButtonGroup(self)
+        for i, lbl in enumerate(labels):
+            rb = QRadioButton(lbl)
+            func_group_layout.addWidget(rb)
+            self._func_radio_buttons.append(rb)
+            self._radio_btn_group.addButton(rb, i)
+            rb.toggled.connect(lambda checked, idx=i: self._on_func_radio_toggled(idx, checked))
+
+        # 根据默认值设置初始选中项
+        inv_map = {val: key for key, val in self._function_map.items()}
+        default_func = self._defaults.get("function", "sin")
+        default_idx = inv_map.get(default_func, 0)
+        if 0 <= default_idx < len(self._func_radio_buttons):
+            self._func_radio_buttons[default_idx].setChecked(True)
+
+        left_layout.addWidget(func_group)
+
         # 定义域范围（x 轴）
         self.x_min = QDoubleSpinBox()
         self.x_min.setRange(-1000.0, 1000.0)
@@ -147,7 +189,12 @@ class MainWindow(QMainWindow):
 
         plot_layout.addWidget(self.canvas)
 
-        self.ax1, self.ax2 = self.figure.subplots(2, 1)
+        axs = self.figure.subplots(2, 2)
+        self.ax_time_cont = axs[0, 0]
+        self.ax_time_disc = axs[0, 1]
+        self.ax_freq_cont = axs[1, 0]
+        self.ax_freq_disc = axs[1, 1]
+        self._ui_ready = True
         self._plot()
 
         self.update_btn.clicked.connect(self._plot)
@@ -158,6 +205,8 @@ class MainWindow(QMainWindow):
         self.x_max.valueChanged.connect(self._plot)
         self.y_min.valueChanged.connect(self._plot)
         self.y_max.valueChanged.connect(self._plot)
+        self.function_select.currentIndexChanged.connect(self._plot)
+        self.show_sampling.toggled.connect(self._plot)
 
         self._set_info("就绪：修改参数可实时更新")
 
@@ -174,20 +223,46 @@ class MainWindow(QMainWindow):
             (self.x_max, self._defaults["x_max"]),
             (self.y_min, self._defaults["y_min"]),
             (self.y_max, self._defaults["y_max"]),
+            (self.function_select, self._defaults.get("function", "sin")),
+            (self.show_sampling, self._defaults.get("show_sampling", False)),
         ]
 
         for w, _ in widgets:
             w.blockSignals(True)
         try:
             for w, v in widgets:
-                w.setValue(v)
+                # QComboBox 和 QCheckBox 需要分别处理
+                if isinstance(w, QComboBox):
+                    # 将默认的关键字映射回索引
+                    inv_map = {val: key for key, val in self._function_map.items()}
+                    idx = inv_map.get(v, 0)
+                    w.setCurrentIndex(idx)
+                elif isinstance(w, QCheckBox):
+                    w.setChecked(bool(v))
+                else:
+                    w.setValue(v)
         finally:
             for w, _ in widgets:
                 w.blockSignals(False)
 
         self._plot()
 
+    def _on_func_radio_toggled(self, idx: int, checked: bool) -> None:
+        if not checked:
+            return
+        if not getattr(self, "_ui_ready", False):
+            return
+        # 将单选按钮的选择同步到组合框
+        try:
+            self.function_select.setCurrentIndex(idx)
+        except Exception:
+            pass
+        # 触发更新
+        self._plot()
+
     def _plot(self) -> None:
+        if not getattr(self, "_ui_ready", False):
+            return
         n = int(self.n_points.value())
         step = float(self.discrete_step.value())
         x_min = float(self.x_min.value())
@@ -202,33 +277,61 @@ class MainWindow(QMainWindow):
             self._set_info("范围无效：需要 y_min < y_max")
             return
 
-        self.ax1.clear()
-        self.ax2.clear()
+        self.ax_time_cont.clear()
+        self.ax_time_disc.clear()
+        self.ax_freq_cont.clear()
+        self.ax_freq_disc.clear()
 
         # 连续信号
         x = np.linspace(x_min, x_max, n)
-        y = np.sin(x)
+        # 选择函数类型
+        func_key = self._function_map.get(self.function_select.currentIndex(), "sin")
+        title_map = {"sin": "y = sin(x)", "cos": "y = cos(x)", "impulse": "冲激（近似）", "step": "阶跃函数"}
+        if func_key == "sin":
+            y = np.sin(x)
+        elif func_key == "cos":
+            y = np.cos(x)
+        elif func_key == "impulse":
+            y = np.zeros_like(x)
+            idx0 = int(np.argmin(np.abs(x)))
+            y[idx0] = 1.0
+        elif func_key == "step":
+            y = np.where(x >= 0.0, 1.0, 0.0)
+        else:
+            y = np.sin(x)
+
         y_cont_min = float(np.min(y))
         y_cont_max = float(np.max(y))
         idx_cont_max = int(np.argmax(y))
         idx_cont_min = int(np.argmin(y))
         x_cont_at_max = float(x[idx_cont_max])
         x_cont_at_min = float(x[idx_cont_min])
-        self.ax1.plot(x, y, label="sin(x)")
-        self.ax1.set_title("y = sin(x) (Continuous)")
-        self.ax1.set_xlabel("x")
-        self.ax1.set_ylabel("y")
-        self.ax1.set_xlim(x_min, x_max)
-        self.ax1.set_ylim(y_min, y_max)
-        self.ax1.grid(True)
-        self.ax1.legend()
+        self.ax_time_cont.plot(x, y, label=None)
+        self.ax_time_cont.set_title(f"{title_map.get(func_key, 'y = sin(x)')} (Continuous)")
+        self.ax_time_cont.set_xlabel("x")
+        self.ax_time_cont.set_ylabel("y")
+        self.ax_time_cont.set_xlim(x_min, x_max)
+        self.ax_time_cont.set_ylim(y_min, y_max)
+        self.ax_time_cont.grid(True)
+        self.ax_time_cont.legend([title_map.get(func_key, 'sin')])
 
         # 离散信号
         x_discrete = np.arange(x_min, x_max, step)
         if x_discrete.size == 0:
             self._set_info("离散点为空：请减小 Δx 或增大 x 范围")
             return
-        y_discrete = np.sin(x_discrete)
+        if func_key == "sin":
+            y_discrete = np.sin(x_discrete)
+        elif func_key == "cos":
+            y_discrete = np.cos(x_discrete)
+        elif func_key == "impulse":
+            y_discrete = np.zeros_like(x_discrete)
+            idx0 = int(np.argmin(np.abs(x_discrete)))
+            y_discrete[idx0] = 1.0
+        elif func_key == "step":
+            y_discrete = np.where(x_discrete >= 0.0, 1.0, 0.0)
+        else:
+            y_discrete = np.sin(x_discrete)
         y_disc_min = float(np.min(y_discrete))
         y_disc_max = float(np.max(y_discrete))
         idx_disc_max = int(np.argmax(y_discrete))
@@ -237,27 +340,47 @@ class MainWindow(QMainWindow):
         x_disc_at_min = float(x_discrete[idx_disc_min])
         x_disc_first = float(x_discrete[0])
         x_disc_last = float(x_discrete[-1])
-        markerline, stemlines, baseline = self.ax2.stem(
+        markerline, stemlines, baseline = self.ax_time_disc.stem(
             x_discrete,
             y_discrete,
-            label="sin(x) (Discrete)",
+            label=f"{title_map.get(func_key, 'sin')} (Discrete)",
         )
         plt_like_color = "C0"
         markerline.set_color(plt_like_color)
         stemlines.set_color(plt_like_color)
         baseline.set_color("0.5")
 
-        self.ax2.set_title("y = sin(x) (Discrete)")
-        self.ax2.set_xlabel("x")
-        self.ax2.set_ylabel("y")
-        self.ax2.set_xlim(x_min, x_max)
-        self.ax2.set_ylim(y_min, y_max)
-        self.ax2.grid(True)
-        self.ax2.legend()
+        self.ax_time_disc.set_title(f"{title_map.get(func_key, 'y = sin(x)')} (Discrete)")
+        self.ax_time_disc.set_xlabel("x")
+        self.ax_time_disc.set_ylabel("y")
+        self.ax_time_disc.set_xlim(x_min, x_max)
+        self.ax_time_disc.set_ylim(y_min, y_max)
+        self.ax_time_disc.grid(True)
+        self.ax_time_disc.legend()
+
+        # 频谱（幅度谱）
+        cont_dx = (x_max - x_min) / max(n - 1, 1)
+        cont_freq = np.fft.rfftfreq(n, d=cont_dx)
+        cont_mag = np.abs(np.fft.rfft(y)) / max(n, 1)
+        self.ax_freq_cont.plot(cont_freq, cont_mag, color="C1")
+        self.ax_freq_cont.set_title("Magnitude Spectrum (Continuous Sampled)")
+        self.ax_freq_cont.set_xlabel("f")
+        self.ax_freq_cont.set_ylabel("|X(f)|")
+        self.ax_freq_cont.grid(True)
+
+        disc_n = max(x_discrete.size, 1)
+        disc_freq = np.fft.rfftfreq(disc_n, d=step)
+        disc_mag = np.abs(np.fft.rfft(y_discrete)) / disc_n
+        self.ax_freq_disc.plot(disc_freq, disc_mag, color="C2")
+        self.ax_freq_disc.set_title("Magnitude Spectrum (Discrete)")
+        self.ax_freq_disc.set_xlabel("f")
+        self.ax_freq_disc.set_ylabel("|X(f)|")
+        self.ax_freq_disc.grid(True)
 
         self.canvas.draw_idle()
         self._set_info(
             "已更新\n"
+            f"- 函数 = {title_map.get(func_key, 'sin')}\n"
             f"- 连续点数 N = {n}\n"
             f"- 离散步长 Δx = {step:.2f}（离散点数 {x_discrete.size}）\n"
             f"- x 范围(显示) = [{x_min:.3f}, {x_max:.3f}]\n"
