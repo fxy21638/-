@@ -25,7 +25,8 @@ feature_names = X.columns.tolist()  # 保存特征列表（如['meanfreq', 'sd',
 joblib.dump(feature_names, r"D:\new_document\Document\voice\voice_feature_names.pkl")
 
 # 4. 记录标签映射（例如：0=male，1=female，需根据数据确认）
-label_mapping = {0: "男性", 1: "女性"}
+# LabelEncoder 按字母序排列: "female"→0, "male"→1
+label_mapping = {0: "女性", 1: "男性"}
 joblib.dump(label_mapping, r"D:\new_document\Document\voice\voice_label_mapping.pkl")
 
 print("模型保存完成！特征列表：", feature_names[:5])  # 输出前5个特征确认

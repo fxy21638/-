@@ -4,36 +4,107 @@
 <head>
     <meta charset="UTF-8">
     <title>实时声音男女识别</title>
-    <!-- 引入Chart.js（可视化） -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        body {
+            margin: 0;
+            font-family: "Microsoft YaHei", sans-serif;
+            background: linear-gradient(180deg, #f7fafc 0%, #eef4ff 100%);
+            color: #243447;
+        }
+
         .container {
-            width: 80%;
+            width: min(920px, 92vw);
             margin: 0 auto;
+            padding: 32px 0 48px;
             text-align: center;
         }
 
-        .result {
-            font-size: 24px;
-            margin: 20px 0;
-            color: #2c3e50;
+        h1 {
+            margin-bottom: 20px;
         }
 
-        .confidence {
-            color: #e74c3c;
-            font-weight: bold;
-        }
-
-        .chart-container {
-            height: 300px;
-            margin: 20px 0;
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 20px;
         }
 
         button {
             padding: 12px 24px;
             font-size: 18px;
-            margin: 0 10px;
+            border: none;
+            border-radius: 10px;
+            background: #2d6cdf;
+            color: #fff;
             cursor: pointer;
+        }
+
+        button:disabled {
+            background: #9eb3d3;
+            cursor: not-allowed;
+        }
+
+        .control-panel,
+        .result-card,
+        .chart-card {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid #d8e2f0;
+            border-radius: 16px;
+            box-shadow: 0 10px 30px rgba(45, 108, 223, 0.08);
+        }
+
+        .control-panel {
+            width: min(560px, 100%);
+            margin: 0 auto 22px;
+            padding: 18px 20px;
+            text-align: left;
+        }
+
+        .control-panel label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+
+        .control-panel input[type="range"] {
+            width: 100%;
+        }
+
+        .control-hint {
+            margin: 8px 0 0;
+            color: #607086;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .result-card {
+            margin: 0 auto 22px;
+            padding: 18px;
+            font-size: 22px;
+        }
+
+        .confidence {
+            color: #d9485f;
+            font-weight: bold;
+        }
+
+        .charts {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 18px;
+        }
+
+        .chart-card {
+            padding: 18px;
+        }
+
+        .chart-container {
+            height: 280px;
         }
     </style>
 </head>
@@ -41,64 +112,112 @@
 <body>
     <div class="container">
         <h1>实时声音男女识别</h1>
-        <button id="startBtn">开始采集</button>
-        <button id="stopBtn" disabled>停止采集</button>
 
-        <!-- 识别结果展示 -->
-        <div class="result">
+        <div class="actions">
+            <button id="startBtn">开始采集</button>
+            <button id="stopBtn" disabled>停止采集</button>
+            <button id="exportBtn" disabled>导出录音</button>
+            <button id="toFemaleBtn" disabled>转换为女声</button>
+            <button id="toMaleBtn" disabled>转换为男声</button>
+        </div>
+
+        <div class="control-panel">
+            <label for="femaleStrength">
+                <span>女声强度 / 明亮度</span>
+                <strong id="femaleStrengthValue">55%</strong>
+            </label>
+            <input id="femaleStrength" type="range" min="0" max="100" value="55">
+            <p class="control-hint">数值越高，女声越明显、越明亮；中间值更偏自然女声，建议先试听 45% 到 65%。</p>
+        </div>
+
+        <div class="actions" style="margin-top:12px;">
+            <input type="file" id="audioFileInput" accept="audio/*" style="display:none;">
+            <button id="uploadBtn">上传音频测试</button>
+            <span id="uploadStatus" style="margin-left:12px;font-size:14px;color:#666;"></span>
+        </div>
+
+        <div class="result-card">
             识别结果：<span id="gender">未识别</span>
             置信度：<span class="confidence" id="confidence">--</span>%
+            <div id="debugInfo" style="margin-top:8px;font-size:12px;color:#888;text-align:left;max-width:600px;margin-left:auto;margin-right:auto;"></div>
         </div>
 
-        <!-- 幅度可视化（波形图） -->
-        <h3>实时声音幅度</h3>
-        <div class="chart-container">
-            <canvas id="amplitudeChart"></canvas>
-        </div>
-
-        <!-- 频率可视化（柱状图） -->
-        <h3>平均频率（Hz）</h3>
-        <div class="chart-container">
-            <canvas id="frequencyChart"></canvas>
+        <div class="charts">
+            <div class="chart-card">
+                <h3>实时声音幅度</h3>
+                <div class="chart-container">
+                    <canvas id="amplitudeChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-card">
+                <h3>平均频率（Hz）</h3>
+                <div class="chart-container">
+                    <canvas id="frequencyChart"></canvas>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
-        // 1. 初始化变量
         let recorder = null;
         let audioContext = null;
         let captureTimer = null;
         let isSending = false;
         let activeStream = null;
-        let amplitudeChart = null;  // 幅度图表
-        let frequencyChart = null;  // 频率图表
-        let amplitudeData = [];     // 幅度数据
-        let frequencyData = [];     // 频率数据
-        const API_URL = "http://127.0.0.1:8000/predict_voice";  // 后端API地址
+        let amplitudeChart = null;
+        let frequencyChart = null;
+        let amplitudeData = [];
+        let frequencyData = [];
+        let lastFullBlob = null;
 
-        // 2. 初始化图表（页面加载完成后）
+        const API_URL = "http://127.0.0.1:8000/predict_voice";
+        const CONVERT_URL = "http://127.0.0.1:8000/convert_voice";
+        const femaleStrengthSlider = document.getElementById("femaleStrength");
+        const femaleStrengthValue = document.getElementById("femaleStrengthValue");
+
+        function getFemaleStrength() {
+            return Number(femaleStrengthSlider.value) / 100;
+        }
+
+        function updateFemaleStrengthLabel() {
+            femaleStrengthValue.textContent = `${femaleStrengthSlider.value}%`;
+        }
+
+        function trimChartData(dataArray, chart, maxPoints = 30) {
+            if (dataArray.length > maxPoints) {
+                dataArray.shift();
+                chart.data.labels.shift();
+            }
+        }
+
         window.onload = function () {
-            // 幅度图表（折线图：实时展示幅度变化）
+            updateFemaleStrengthLabel();
+
             const ampCtx = document.getElementById("amplitudeChart").getContext("2d");
             amplitudeChart = new Chart(ampCtx, {
                 type: "line",
                 data: {
-                    labels: [],  // X轴：时间（秒）
+                    labels: [],
                     datasets: [{
                         label: "声音幅度",
                         data: amplitudeData,
-                        borderColor: "#3498db",
-                        tension: 0.1,
+                        borderColor: "#2d6cdf",
+                        tension: 0.25,
                         fill: false
                     }]
                 },
                 options: {
                     responsive: true,
-                    scales: { y: { beginAtZero: true, title: { text: "幅度值", display: true } } }
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { text: "幅度值", display: true }
+                        }
+                    }
                 }
             });
 
-            // 频率图表（折线图：展示平均频率变化）
             const freqCtx = document.getElementById("frequencyChart").getContext("2d");
             frequencyChart = new Chart(freqCtx, {
                 type: "line",
@@ -107,19 +226,26 @@
                     datasets: [{
                         label: "频率（Hz）",
                         data: frequencyData,
-                        borderColor: "#2ecc71",
-                        tension: 0.1,
+                        borderColor: "#22a06b",
+                        tension: 0.25,
                         fill: false
                     }]
                 },
                 options: {
                     responsive: true,
-                    scales: { y: { beginAtZero: true, title: { text: "频率（Hz）", display: true } } }
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { text: "频率（Hz）", display: true }
+                        }
+                    }
                 }
             });
         };
 
-        // 3. 开始采集按钮事件
+        femaleStrengthSlider.addEventListener("input", updateFemaleStrengthLabel);
+
         class SimpleRecorder {
             constructor(context, numChannels = 1) {
                 this.context = context;
@@ -127,17 +253,21 @@
                 this.source = null;
                 this.processor = null;
                 this.recording = false;
-                this.buffers = [];
+                this.fullBuffers = [];
+                this.windowBuffers = [];
             }
 
             async init(stream) {
                 this.source = this.context.createMediaStreamSource(stream);
                 this.processor = this.context.createScriptProcessor(4096, this.numChannels, this.numChannels);
-                this.buffers = Array.from({ length: this.numChannels }, () => []);
+                this.fullBuffers = Array.from({ length: this.numChannels }, () => []);
+                this.windowBuffers = Array.from({ length: this.numChannels }, () => []);
                 this.processor.onaudioprocess = (event) => {
                     if (!this.recording) return;
                     for (let ch = 0; ch < this.numChannels; ch += 1) {
-                        this.buffers[ch].push(new Float32Array(event.inputBuffer.getChannelData(ch)));
+                        const chunk = new Float32Array(event.inputBuffer.getChannelData(ch));
+                        this.fullBuffers[ch].push(chunk);
+                        this.windowBuffers[ch].push(chunk);
                     }
                 };
                 this.source.connect(this.processor);
@@ -145,21 +275,35 @@
             }
 
             start() {
-                this.buffers = Array.from({ length: this.numChannels }, () => []);
+                this.fullBuffers = Array.from({ length: this.numChannels }, () => []);
+                this.windowBuffers = Array.from({ length: this.numChannels }, () => []);
                 this.recording = true;
+            }
+
+            resetWindow() {
+                this.windowBuffers = Array.from({ length: this.numChannels }, () => []);
             }
 
             stop() {
                 this.recording = false;
-                const buffer = this._mergeBuffers();
+                const buffer = this._mergeBuffers(this.fullBuffers);
                 const wav = this._encodeWAV(buffer);
                 return { blob: new Blob([wav], { type: "audio/wav" }) };
             }
 
-            _mergeBuffers() {
+            consumeWindow() {
+                const hasData = this.windowBuffers.some((arr) => arr.length > 0);
+                if (!hasData) return null;
+                const buffer = this._mergeBuffers(this.windowBuffers);
+                this.windowBuffers = Array.from({ length: this.numChannels }, () => []);
+                const wav = this._encodeWAV(buffer);
+                return { blob: new Blob([wav], { type: "audio/wav" }) };
+            }
+
+            _mergeBuffers(buffers) {
                 const merged = [];
                 for (let ch = 0; ch < this.numChannels; ch += 1) {
-                    const channelBuffer = this.buffers[ch];
+                    const channelBuffer = buffers[ch] || [];
                     const length = channelBuffer.reduce((sum, buf) => sum + buf.length, 0);
                     const result = new Float32Array(length);
                     let offset = 0;
@@ -223,85 +367,186 @@
         }
 
         document.getElementById("startBtn").addEventListener("click", async function () {
-            // 启用麦克风（WebRTC）
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             activeStream = stream;
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 22050 });
+            if (audioContext.state === "suspended") {
+                await audioContext.resume();
+            }
+
             recorder = new SimpleRecorder(audioContext, 1);
             await recorder.init(stream);
             recorder.start();
 
-            // 切换按钮状态
             this.disabled = true;
             document.getElementById("stopBtn").disabled = false;
+            document.getElementById("exportBtn").disabled = true;
+            document.getElementById("toFemaleBtn").disabled = true;
+            document.getElementById("toMaleBtn").disabled = true;
 
-            // 定时发送音频（每1秒发送一次，实时识别）
             captureTimer = setInterval(async function () {
                 if (!recorder || isSending) return;
                 isSending = true;
 
-                // 停止当前片段录制，获取WAV文件
-                const result = recorder.stop();
-                recorder.start();  // 重新开始录制
+                const result = recorder.consumeWindow();
+                recorder.resetWindow();
 
-                const wavBlob = result.blob;
-
-                // 发送音频到后端API
-                const formData = new FormData();
-                formData.append("file", wavBlob, "audio.wav");
-                const response = await fetch(API_URL, {
-                    method: "POST",
-                    body: formData
-                });
-                const responseData = await response.json();
-
-                // 处理后端返回结果
-                if (responseData.status === "success") {
-                    // 更新识别结果
-                    document.getElementById("gender").textContent = responseData.gender;
-                    document.getElementById("confidence").textContent = responseData.confidence;
-
-                    // 更新幅度图表（添加最新幅度值）
-                    const amp = responseData.display_features.amplitude;
-                    amplitudeData.push(amp);
-                    amplitudeChart.data.labels.push(amplitudeData.length);  // X轴：第n秒
-                    amplitudeChart.data.datasets[0].data = amplitudeData;
-                    amplitudeChart.update();
-
-                    // 更新频率图表（显示最新平均频率）
-                    const freq = responseData.display_features.mean_frequency;
-                    frequencyData.push(freq);
-                    frequencyChart.data.labels.push(frequencyData.length);
-                    frequencyChart.data.datasets[0].data = frequencyData;
-                    frequencyChart.update();
-                } else {
-                    console.error("识别错误：", responseData.message);
+                if (!result) {
+                    isSending = false;
+                    return;
                 }
+
+                const formData = new FormData();
+                formData.append("file", result.blob, "audio.wav");
+
+                try {
+                    const response = await fetch(API_URL, {
+                        method: "POST",
+                        body: formData
+                    });
+                    const responseData = await response.json();
+
+                    if (responseData.status === "success") {
+                        document.getElementById("gender").textContent = responseData.gender;
+                        document.getElementById("confidence").textContent = responseData.confidence;
+
+                        amplitudeData.push(responseData.display_features.amplitude);
+                        amplitudeChart.data.labels.push(amplitudeData.length);
+                        trimChartData(amplitudeData, amplitudeChart);
+                        amplitudeChart.data.datasets[0].data = amplitudeData;
+                        amplitudeChart.update();
+
+                        frequencyData.push(responseData.display_features.mean_frequency);
+                        frequencyChart.data.labels.push(frequencyData.length);
+                        trimChartData(frequencyData, frequencyChart);
+                        frequencyChart.data.datasets[0].data = frequencyData;
+                        frequencyChart.update();
+                    } else {
+                        console.error("识别错误：", responseData.message);
+                    }
+                } catch (error) {
+                    console.error("请求失败：", error);
+                }
+
                 isSending = false;
-            }, 1000);  // 每1秒处理一次
+            }, 1000);
         });
 
-        // 4. 停止采集按钮事件
         document.getElementById("stopBtn").addEventListener("click", async function () {
             if (captureTimer) {
                 clearInterval(captureTimer);
                 captureTimer = null;
             }
             if (recorder) {
-                recorder.stop();
+                const result = recorder.stop();
+                lastFullBlob = result ? result.blob : null;
                 recorder = null;
             }
             if (activeStream) {
-                activeStream.getTracks().forEach(track => track.stop());  // 关闭麦克风
+                activeStream.getTracks().forEach(track => track.stop());
                 activeStream = null;
             }
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;
             }
-            // 切换按钮状态
+
             this.disabled = true;
             document.getElementById("startBtn").disabled = false;
+            document.getElementById("exportBtn").disabled = !lastFullBlob;
+            document.getElementById("toFemaleBtn").disabled = !lastFullBlob;
+            document.getElementById("toMaleBtn").disabled = !lastFullBlob;
+        });
+
+        function downloadBlob(blob, filename) {
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        document.getElementById("exportBtn").addEventListener("click", function () {
+            if (!lastFullBlob) return;
+            downloadBlob(lastFullBlob, "recording.wav");
+        });
+
+        async function convertAndDownload(target) {
+            if (!lastFullBlob) return;
+            const formData = new FormData();
+            formData.append("file", lastFullBlob, "recording.wav");
+            formData.append("target", target);
+            if (target === "female") {
+                formData.append("fem_strength", String(getFemaleStrength()));
+            }
+
+            try {
+                const response = await fetch(CONVERT_URL, {
+                    method: "POST",
+                    body: formData
+                });
+                if (!response.ok) {
+                    console.error("转换失败：", await response.text());
+                    return;
+                }
+                const convertedBlob = await response.blob();
+                const filename = target === "female" ? "converted_female.wav" : "converted_male.wav";
+                downloadBlob(convertedBlob, filename);
+            } catch (error) {
+                console.error("转换请求失败：", error);
+            }
+        }
+
+        document.getElementById("toFemaleBtn").addEventListener("click", function () {
+            convertAndDownload("female");
+        });
+
+        document.getElementById("toMaleBtn").addEventListener("click", function () {
+            convertAndDownload("male");
+        });
+
+        // 上传音频文件测试
+        document.getElementById("uploadBtn").addEventListener("click", function () {
+            document.getElementById("audioFileInput").click();
+        });
+        document.getElementById("audioFileInput").addEventListener("change", async function () {
+            const file = this.files[0];
+            if (!file) return;
+            const statusEl = document.getElementById("uploadStatus");
+            statusEl.textContent = "正在分析...";
+            const formData = new FormData();
+            formData.append("file", file);
+            try {
+                const response = await fetch(API_URL, { method: "POST", body: formData });
+                const data = await response.json();
+                document.getElementById("gender").textContent = data.gender;
+                document.getElementById("confidence").textContent = data.confidence;
+                if (data.debug) {
+                    let html = "<b>调试:</b><br>";
+                    html += "原始预测: " + data.debug.raw_prediction + " | 概率: " + data.debug.model_proba + "<br>";
+                    html += "时长: " + data.debug.duration + "s<br>";
+                    html += "<b>关键特征:</b> ";
+                    const keys = ["meanfreq","meanfun","IQR","sd","sp.ent","sfm","meandom","mindom","maxdom","modindx","skew","kurt"];
+                    for (const k of keys) {
+                        if (data.debug.features[k] !== undefined) {
+                            html += k + "=" + data.debug.features[k] + " ";
+                        }
+                    }
+                    if (data.debug.outliers && data.debug.outliers.length > 0) {
+                        html += "<br><b style='color:red;'>偏离训练范围:</b> " + data.debug.outliers.join(", ");
+                    } else {
+                        html += "<br><b style='color:green;'>所有特征在训练数据范围内</b>";
+                    }
+                    document.getElementById("debugInfo").innerHTML = html;
+                }
+                statusEl.textContent = "分析完成: " + data.gender;
+            } catch (err) {
+                statusEl.textContent = "请求失败: " + err.message;
+                console.error(err);
+            }
         });
     </script>
 </body>
