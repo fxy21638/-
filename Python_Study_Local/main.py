@@ -400,35 +400,14 @@ def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
     return np.exp(smoothed)
 
 
-def _detect_voice_activity(y: np.ndarray, sr: int, min_voiced_ratio: float = 0.3) -> bool:
+def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
     """
-    检测音频中是否包含足够的人声活动
-    
-    Args:
-        y: 音频信号数组
-        sr: 采样率
-        min_voiced_ratio: 最小有效人声比例阈值，默认0.3（30%）
-    
-    Returns:
-        bool: True表示包含足够人声，False表示主要是杂音
+    快速语音活动检测（基于 RMS 能量，替代慢速 pyworld.harvest）
     """
-    try:
-        # 使用pyworld的harvest算法提取基频
-        f0, _ = pw.harvest(y, sr, f0_floor=50.0, f0_ceil=500.0)
-        
-        # 计算有效人声点的比例
-        total_frames = len(f0)
-        if total_frames == 0:
-            return False
-            
-        voiced_frames = np.sum(f0 > 0)
-        voiced_ratio = voiced_frames / total_frames
-        
-        # 如果有效人声比例低于阈值，认为是杂音
-        return voiced_ratio >= min_voiced_ratio
-    except Exception:
-        # 如果VAD失败，保守地认为包含人声（避免误过滤真实语音）
-        return True
+    if y.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(y ** 2)))
+    return rms >= min_rms
 
 
 def _extract_voiced_segments(y: np.ndarray, sr: int, frame_length: int = 256, hop_length: int = 128) -> np.ndarray:
@@ -489,7 +468,7 @@ async def predict_voice(file: UploadFile = File(...)):
         duration = float(y.size / sr) if sr else 0.0
         
         # 新增：人声活动检测
-        if not _detect_voice_activity(y, sr, min_voiced_ratio=0.2):
+        if not _detect_voice_activity(y, sr):
             # 如果检测到主要是杂音，返回低置信度结果
             return {
                 "status": "success",

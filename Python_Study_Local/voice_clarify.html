@@ -300,6 +300,14 @@
                 return { blob: new Blob([wav], { type: "audio/wav" }) };
             }
 
+            getFullBlob() {
+                const hasData = this.fullBuffers.some((arr) => arr.length > 0);
+                if (!hasData) return null;
+                const buffer = this._mergeBuffers(this.fullBuffers);
+                const wav = this._encodeWAV(buffer);
+                return new Blob([wav], { type: "audio/wav" });
+            }
+
             _mergeBuffers(buffers) {
                 const merged = [];
                 for (let ch = 0; ch < this.numChannels; ch += 1) {
@@ -369,7 +377,7 @@
         document.getElementById("startBtn").addEventListener("click", async function () {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             activeStream = stream;
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 22050 });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
             if (audioContext.state === "suspended") {
                 await audioContext.resume();
             }
@@ -388,16 +396,14 @@
                 if (!recorder || isSending) return;
                 isSending = true;
 
-                const result = recorder.consumeWindow();
-                recorder.resetWindow();
-
-                if (!result) {
+                const blob = recorder.getFullBlob();
+                if (!blob || blob.size < 1000) {
                     isSending = false;
                     return;
                 }
 
                 const formData = new FormData();
-                formData.append("file", result.blob, "audio.wav");
+                formData.append("file", blob, "audio.wav");
 
                 try {
                     const response = await fetch(API_URL, {
@@ -429,7 +435,7 @@
                 }
 
                 isSending = false;
-            }, 1000);
+            }, 2000);
         });
 
         document.getElementById("stopBtn").addEventListener("click", async function () {
