@@ -400,9 +400,10 @@ def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
     return np.exp(smoothed)
 
 
-def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
+def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.012) -> bool:
     """
     快速语音活动检测（基于 RMS 能量，替代慢速 pyworld.harvest）
+    安静环境噪声通常在 0.003 以下，人声通常在 0.02 以上
     """
     if y.size == 0:
         return False
@@ -496,10 +497,13 @@ async def predict_voice(file: UploadFile = File(...)):
         raw_gender_cn = str(label_mapping.get(pred_label, pred_label))
         predicted_gender = GENDER_MAP.get(raw_gender_cn, raw_gender_cn)
 
+        # 幅度取最后 1 秒，避免累积音频导致图表变平
+        recent_y = y[-int(sr):] if y.size > sr else y
+
         display_features = {
-            "mean_frequency": round(float(feature_df["meanfreq"].iloc[0]), 2),
-            "mean_pitch": round(float(feature_df["meanfun"].iloc[0]), 2),
-            "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
+            "mean_frequency": round(float(feature_df["meanfreq"].iloc[0]), 3),
+            "mean_pitch": round(float(feature_df["meanfun"].iloc[0]), 3),
+            "amplitude": round(float(np.max(np.abs(recent_y))), 4) if recent_y.size else 0.0,
             "duration": round(duration, 3),
         }
 

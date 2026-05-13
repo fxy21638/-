@@ -169,6 +169,7 @@
         let amplitudeData = [];
         let frequencyData = [];
         let lastFullBlob = null;
+        let recordingStartTime = null;
 
         const API_URL = "http://127.0.0.1:8000/predict_voice";
         const CONVERT_URL = "http://127.0.0.1:8000/convert_voice";
@@ -236,8 +237,17 @@
                     maintainAspectRatio: false,
                     scales: {
                         y: {
-                            beginAtZero: true,
-                            title: { text: "频率（Hz）", display: true }
+                            min: 0.03,
+                            title: { text: "频率（归一化）", display: true }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            callbacks: {
+                                label: function(ctx) {
+                                    return ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3);
+                                }
+                            }
                         }
                     }
                 }
@@ -286,9 +296,14 @@
 
             stop() {
                 this.recording = false;
-                const buffer = this._mergeBuffers(this.fullBuffers);
+                this.savedBuffers = this.fullBuffers.map(function (arr) { return arr.slice(); });
+            }
+
+            encodeSaved() {
+                if (!this.savedBuffers || this.savedBuffers.every(function (arr) { return arr.length === 0; })) return null;
+                const buffer = this._mergeBuffers(this.savedBuffers);
                 const wav = this._encodeWAV(buffer);
-                return { blob: new Blob([wav], { type: "audio/wav" }) };
+                return new Blob([wav], { type: "audio/wav" });
             }
 
             consumeWindow() {
@@ -305,6 +320,27 @@
                 if (!hasData) return null;
                 const buffer = this._mergeBuffers(this.fullBuffers);
                 const wav = this._encodeWAV(buffer);
+                return new Blob([wav], { type: "audio/wav" });
+            }
+
+            getRecentBlob(durationSec) {
+                const sampleRate = this.context.sampleRate;
+                const samplesNeeded = Math.ceil(durationSec * sampleRate);
+                const selected = [];
+                let totalSamples = 0;
+                const src = this.fullBuffers[0];
+                for (let i = src.length - 1; i >= 0 && totalSamples < samplesNeeded; i -= 1) {
+                    selected.unshift(src[i]);
+                    totalSamples += src[i].length;
+                }
+                if (selected.length === 0) return null;
+                const result = new Float32Array(totalSamples);
+                let offset = 0;
+                for (const chunk of selected) {
+                    result.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                const wav = this._encodeWAV(result);
                 return new Blob([wav], { type: "audio/wav" });
             }
 
@@ -385,6 +421,7 @@
             recorder = new SimpleRecorder(audioContext, 1);
             await recorder.init(stream);
             recorder.start();
+            recordingStartTime = Date.now();
 
             this.disabled = true;
             document.getElementById("stopBtn").disabled = false;
@@ -394,9 +431,11 @@
 
             captureTimer = setInterval(async function () {
                 if (!recorder || isSending) return;
+                const elapsed = (Date.now() - recordingStartTime) / 1000;
+                if (elapsed < 3.0) return;
                 isSending = true;
 
-                const blob = recorder.getFullBlob();
+                const blob = recorder.getRecentBlob(5);
                 if (!blob || blob.size < 1000) {
                     isSending = false;
                     return;
@@ -413,8 +452,14 @@
                     const responseData = await response.json();
 
                     if (responseData.status === "success") {
-                        document.getElementById("gender").textContent = responseData.gender;
-                        document.getElementById("confidence").textContent = responseData.confidence;
+                        const gender = responseData.gender;
+                        if (gender === "unknown") {
+                            document.getElementById("gender").textContent = "未检测到人声";
+                            document.getElementById("confidence").textContent = "--";
+                        } else {
+                            document.getElementById("gender").textContent = gender;
+                            document.getElementById("confidence").textContent = responseData.confidence;
+                        }
 
                         amplitudeData.push(responseData.display_features.amplitude);
                         amplitudeChart.data.labels.push(amplitudeData.length);
@@ -444,9 +489,8 @@
                 captureTimer = null;
             }
             if (recorder) {
-                const result = recorder.stop();
-                lastFullBlob = result ? result.blob : null;
-                recorder = null;
+                recorder.stop();
+                lastFullBlob = true;
             }
             if (activeStream) {
                 activeStream.getTracks().forEach(track => track.stop());
@@ -456,6 +500,7 @@
                 audioContext.close();
                 audioContext = null;
             }
+            recordingStartTime = null;
 
             this.disabled = true;
             document.getElementById("startBtn").disabled = false;
@@ -476,14 +521,18 @@
         }
 
         document.getElementById("exportBtn").addEventListener("click", function () {
-            if (!lastFullBlob) return;
-            downloadBlob(lastFullBlob, "recording.wav");
+            if (!lastFullBlob || !recorder) return;
+            const blob = recorder.encodeSaved();
+            if (!blob) return;
+            downloadBlob(blob, "recording.wav");
         });
 
         async function convertAndDownload(target) {
-            if (!lastFullBlob) return;
+            if (!lastFullBlob || !recorder) return;
+            const blob = recorder.encodeSaved();
+            if (!blob) return;
             const formData = new FormData();
-            formData.append("file", lastFullBlob, "recording.wav");
+            formData.append("file", blob, "recording.wav");
             formData.append("target", target);
             if (target === "female") {
                 formData.append("fem_strength", String(getFemaleStrength()));
