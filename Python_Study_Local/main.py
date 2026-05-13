@@ -494,10 +494,7 @@ async def predict_voice(file: UploadFile = File(...)):
         pred_prob = float(raw_proba.max())
         pred_label = int(model.predict(feature_df)[0])
         raw_gender_cn = str(label_mapping.get(pred_label, pred_label))
-        raw_gender = GENDER_MAP.get(raw_gender_cn, raw_gender_cn)
-
-        # 简化后处理：仅平滑，不做 cue 覆盖（cue 系统容易在边界情况翻车）
-        smoothed_gender, smoothed_prob = _smooth_prediction(raw_gender, pred_prob)
+        predicted_gender = GENDER_MAP.get(raw_gender_cn, raw_gender_cn)
 
         display_features = {
             "mean_frequency": round(float(feature_df["meanfreq"].iloc[0]), 2),
@@ -523,11 +520,11 @@ async def predict_voice(file: UploadFile = File(...)):
 
         return {
             "status": "success",
-            "gender": smoothed_gender,
-            "confidence": round(float(smoothed_prob * 100), 2),
+            "gender": predicted_gender,
+            "confidence": round(float(pred_prob * 100), 2),
             "display_features": display_features,
             "debug": {
-                "raw_prediction": raw_gender,
+                "raw_prediction": predicted_gender,
                 "model_proba": f"{raw_proba[0]:.4f}/{raw_proba[1]:.4f}",
                 "features": all_features,
                 "outliers": outliers,
