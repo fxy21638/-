@@ -14,6 +14,7 @@ import soundfile as sf
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -168,17 +169,18 @@ class PredictWorker(QThread):
     result_ready = Signal(dict)
     error_occurred = Signal(str)
 
-    def __init__(self, audio: np.ndarray, sr: int = 22050, parent=None):
+    def __init__(self, audio: np.ndarray, sr: int = 22050, enable_vad: bool = True, parent=None):
         super().__init__(parent)
         self._audio = audio.copy()
         self._sr = sr
+        self._enable_vad = enable_vad
 
     def run(self):
         try:
             y = self._audio.astype(np.float64 if self._audio.dtype == np.float32 else self._audio.dtype)
             duration = float(y.size / self._sr)
 
-            if not _detect_voice_activity(y, self._sr):
+            if self._enable_vad and not _detect_voice_activity(y, self._sr):
                 self.result_ready.emit({
                     "status": "success",
                     "gender": "unknown",
@@ -310,7 +312,8 @@ class VoiceGenderWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("声音男女识别")
-        self.resize(1000, 680)
+        self.resize(1050, 700)
+        self.setMinimumSize(900, 600)
 
         # 状态
         self._ring: AudioRingBuffer | None = None
@@ -327,12 +330,14 @@ class VoiceGenderWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_charts()
+        self._setup_style()
         self._warmup_done.connect(self._on_warmup_done)
         self._ui_ready = True
         self._update_button_states("idle")
 
-        # 后台加载模型
-        self.statusBar().showMessage("正在加载模型...")
+        # 后台加载模型 — 按钮显示加载状态
+        self.start_btn.setText("模型加载中...")
+        self.statusBar().showMessage("正在加载模型，请稍候...")
         t = threading.Thread(target=self._warmup_model, daemon=True)
         t.start()
 
@@ -341,12 +346,12 @@ class VoiceGenderWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(14)
 
         # 左面板 ──────────────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(380)
+        left.setFixedWidth(400)
         left.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -355,38 +360,51 @@ class VoiceGenderWindow(QMainWindow):
         # 录制控制
         rec_group = QGroupBox("录制控制")
         rec_layout = QVBoxLayout(rec_group)
+        rec_layout.setSpacing(10)
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self.start_btn = QPushButton("开始采集")
-        self.start_btn.setMinimumHeight(36)
+        self.start_btn.setMinimumHeight(34)
         self.stop_btn = QPushButton("停止采集")
-        self.stop_btn.setMinimumHeight(36)
+        self.stop_btn.setMinimumHeight(34)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
         rec_layout.addLayout(btn_row)
         self.export_btn = QPushButton("导出录音 WAV")
-        self.export_btn.setMinimumHeight(32)
+        self.export_btn.setMinimumHeight(30)
         rec_layout.addWidget(self.export_btn)
         self.rec_status = QLabel("就绪")
         self.rec_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         rec_layout.addWidget(self.rec_status)
+        self.vad_checkbox = QCheckBox("人声检测")
+        self.vad_checkbox.setChecked(True)
+        rec_layout.addWidget(self.vad_checkbox)
         left_layout.addWidget(rec_group)
 
         # 变声控制
         conv_group = QGroupBox("声音转换")
         conv_layout = QVBoxLayout(conv_group)
+        conv_layout.setSpacing(8)
         strength_row = QHBoxLayout()
-        strength_row.addWidget(QLabel("女声强度:"))
+        strength_row.setSpacing(8)
+        strength_label = QLabel("女声强度:")
+        strength_label.setMinimumWidth(60)
+        strength_row.addWidget(strength_label)
         self.strength_slider = QSlider(Qt.Orientation.Horizontal)
         self.strength_slider.setRange(0, 100)
         self.strength_slider.setValue(55)
+        strength_row.addWidget(self.strength_slider)
         self.strength_value_label = QLabel("55%")
         self.strength_value_label.setMinimumWidth(36)
-        strength_row.addWidget(self.strength_slider)
+        self.strength_value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         strength_row.addWidget(self.strength_value_label)
         conv_layout.addLayout(strength_row)
         conv_btn_row = QHBoxLayout()
+        conv_btn_row.setSpacing(8)
         self.to_female_btn = QPushButton("转换为女声")
+        self.to_female_btn.setMinimumHeight(30)
         self.to_male_btn = QPushButton("转换为男声")
+        self.to_male_btn.setMinimumHeight(30)
         conv_btn_row.addWidget(self.to_female_btn)
         conv_btn_row.addWidget(self.to_male_btn)
         conv_layout.addLayout(conv_btn_row)
@@ -396,7 +414,7 @@ class VoiceGenderWindow(QMainWindow):
         upload_group = QGroupBox("文件上传测试")
         upload_layout = QVBoxLayout(upload_group)
         self.upload_btn = QPushButton("选择音频文件测试")
-        self.upload_btn.setMinimumHeight(32)
+        self.upload_btn.setMinimumHeight(30)
         upload_layout.addWidget(self.upload_btn)
         self.upload_status = QLabel("")
         self.upload_status.setWordWrap(True)
@@ -406,13 +424,14 @@ class VoiceGenderWindow(QMainWindow):
         # 识别结果
         result_group = QGroupBox("识别结果")
         result_layout = QVBoxLayout(result_group)
+        result_layout.setSpacing(4)
         self.gender_label = QLabel("--")
         self.gender_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.gender_label.setStyleSheet("font-size: 28px; font-weight: bold; padding: 8px;")
+        self.gender_label.setStyleSheet("font-size: 30px; font-weight: bold; padding: 6px 0; color: #334155;")
         result_layout.addWidget(self.gender_label)
         self.confidence_label = QLabel("置信度：--%")
         self.confidence_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.confidence_label.setStyleSheet("font-size: 16px; color: #d9485f;")
+        self.confidence_label.setStyleSheet("font-size: 15px; color: #b91c1c;")
         result_layout.addWidget(self.confidence_label)
         left_layout.addWidget(result_group)
 
@@ -421,8 +440,7 @@ class VoiceGenderWindow(QMainWindow):
         debug_layout = QVBoxLayout(debug_group)
         self.debug_box = QPlainTextEdit()
         self.debug_box.setReadOnly(True)
-        self.debug_box.setMaximumHeight(180)
-        self.debug_box.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
+        self.debug_box.setMaximumHeight(160)
         debug_layout.addWidget(self.debug_box)
         left_layout.addWidget(debug_group)
 
@@ -448,23 +466,29 @@ class VoiceGenderWindow(QMainWindow):
 
     # ── 图表 ─────────────────────────────────────────────────────────
     def _setup_charts(self):
+        self.canvas.figure.set_facecolor("#f7f8fa")
         self.ax_amp = self.canvas.figure.add_subplot(2, 1, 1)
-        self.ax_amp.set_title("实时声音幅度", fontsize=12)
-        self.ax_amp.set_ylabel("幅度")
-        self.ax_amp.grid(True, alpha=0.3)
+        self.ax_amp.set_facecolor("#ffffff")
+        self.ax_amp.set_title("实时声音幅度", fontsize=12, fontweight="bold", color="#374151")
+        self.ax_amp.set_ylabel("幅度", fontsize=10, color="#6b7280")
+        self.ax_amp.grid(True, alpha=0.2, color="#d1d5db")
         self.ax_amp.set_xlim(0, self.MAX_CHART_POINTS)
         self.ax_amp.set_ylim(0, 0.01)
+        self.ax_amp.tick_params(labelsize=9, colors="#6b7280")
 
         self.ax_freq = self.canvas.figure.add_subplot(2, 1, 2)
-        self.ax_freq.set_title("归一化频率", fontsize=12)
-        self.ax_freq.set_ylabel("归一化频率")
-        self.ax_freq.set_xlabel("采样点")
-        self.ax_freq.grid(True, alpha=0.3)
+        self.ax_freq.set_facecolor("#ffffff")
+        self.ax_freq.set_title("归一化频率", fontsize=12, fontweight="bold", color="#374151")
+        self.ax_freq.set_ylabel("归一化频率", fontsize=10, color="#6b7280")
+        self.ax_freq.set_xlabel("采样点", fontsize=10, color="#6b7280")
+        self.ax_freq.grid(True, alpha=0.2, color="#d1d5db")
         self.ax_freq.set_xlim(0, self.MAX_CHART_POINTS)
         self.ax_freq.set_ylim(0.03, 0.28)
+        self.ax_freq.tick_params(labelsize=9, colors="#6b7280")
 
-        self._line_amp = self.ax_amp.plot([], [], color="#2d6cdf")[0]
-        self._line_freq = self.ax_freq.plot([], [], color="#22a06b")[0]
+        self._line_amp, = self.ax_amp.plot([], [], color="#4b5563", linewidth=1.8)
+        self._line_freq, = self.ax_freq.plot([], [], color="#5b7f95", linewidth=1.8)
+        self.canvas.figure.tight_layout()
         self.canvas.draw_idle()
 
     def _update_charts(self, amplitude: float, frequency: float):
@@ -486,6 +510,128 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_amp.set_xlim(-0.5, max(self.MAX_CHART_POINTS - 1, len(xs) - 1) + 0.5)
         self.ax_freq.set_xlim(-0.5, max(self.MAX_CHART_POINTS - 1, len(xs) - 1) + 0.5)
         self.canvas.draw_idle()
+
+    # ── 样式表 ───────────────────────────────────────────────────────
+    def _setup_style(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #eceff4;
+            }
+            QGroupBox {
+                background-color: #ffffff;
+                border: 1px solid #dde1e7;
+                border-radius: 8px;
+                margin-top: 16px;
+                padding: 18px 12px 10px 12px;
+                font-size: 13px;
+                font-weight: bold;
+                color: #475569;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #475569;
+            }
+            QPushButton {
+                background-color: #4b5563;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #374151;
+            }
+            QPushButton:pressed {
+                background-color: #1f2937;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                color: #9ca3af;
+            }
+            QPushButton#export_btn, QPushButton#upload_btn {
+                background-color: #ffffff;
+                color: #4b5563;
+                border: 1px solid #c4cad4;
+            }
+            QPushButton#export_btn:hover, QPushButton#upload_btn:hover {
+                background-color: #f3f4f6;
+                border-color: #9ca3af;
+            }
+            QPushButton#export_btn:disabled, QPushButton#upload_btn:disabled {
+                background-color: #f9fafb;
+                color: #d1d5db;
+                border-color: #e5e7eb;
+            }
+            QPushButton#to_female_btn {
+                background-color: #a55164;
+            }
+            QPushButton#to_female_btn:hover {
+                background-color: #8b3f51;
+            }
+            QPushButton#to_male_btn {
+                background-color: #4f697f;
+            }
+            QPushButton#to_male_btn:hover {
+                background-color: #3d5367;
+            }
+            QLabel {
+                color: #374151;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: #dde1e7;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                width: 16px;
+                height: 16px;
+                margin: -6px 0;
+                background: #4b5563;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #374151;
+            }
+            QPlainTextEdit {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                border-radius: 5px;
+                font-family: "Cascadia Code", "Consolas", monospace;
+                font-size: 12px;
+                padding: 6px;
+            }
+            QCheckBox {
+                font-size: 12px;
+                color: #6b7280;
+            }
+            QCheckBox::indicator {
+                width: 15px;
+                height: 15px;
+                border-radius: 3px;
+                border: 1.5px solid #c4cad4;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:checked {
+                background: #4b5563;
+                border-color: #4b5563;
+            }
+            QStatusBar {
+                background: #ffffff;
+                border-top: 1px solid #e5e7eb;
+                color: #6b7280;
+            }
+        """)
+        self.start_btn.setObjectName("start_btn")
+        self.stop_btn.setObjectName("stop_btn")
+        self.export_btn.setObjectName("export_btn")
+        self.upload_btn.setObjectName("upload_btn")
+        self.to_female_btn.setObjectName("to_female_btn")
+        self.to_male_btn.setObjectName("to_male_btn")
 
     # ── 按钮状态管理 ─────────────────────────────────────────────────
     def _update_button_states(self, state: str):
@@ -525,6 +671,7 @@ class VoiceGenderWindow(QMainWindow):
             self._warmup_done.emit()
 
     def _on_warmup_done(self):
+        self.start_btn.setText("开始采集")
         self.statusBar().showMessage(self._warmup_msg, 5000)
         self._update_button_states("idle")
 
@@ -593,7 +740,7 @@ class VoiceGenderWindow(QMainWindow):
         audio = self._ring.get_last(self.WINDOW_SECONDS)
         if audio is None:
             return
-        self._predict_worker = PredictWorker(audio, sr=self.SAMPLE_RATE)
+        self._predict_worker = PredictWorker(audio, sr=self.SAMPLE_RATE, enable_vad=self.vad_checkbox.isChecked())
         self._predict_worker.result_ready.connect(self._on_prediction_result)
         self._predict_worker.error_occurred.connect(self._on_prediction_error)
         self._predict_worker.finished.connect(lambda: setattr(self, "_predict_worker", None))
@@ -698,7 +845,7 @@ class VoiceGenderWindow(QMainWindow):
             self.upload_status.setText(f"读取失败: {e}")
             return
 
-        self._upload_worker = PredictWorker(y, sr=self.SAMPLE_RATE)
+        self._upload_worker = PredictWorker(y, sr=self.SAMPLE_RATE, enable_vad=self.vad_checkbox.isChecked())
         self._upload_worker.result_ready.connect(self._on_upload_result)
         self._upload_worker.error_occurred.connect(lambda e: self.upload_status.setText(f"分析失败: {e}"))
         self._upload_worker.finished.connect(lambda: setattr(self, "_upload_worker", None))
