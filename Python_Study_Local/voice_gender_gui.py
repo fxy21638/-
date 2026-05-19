@@ -104,6 +104,7 @@ from main import (
     _clamp_control,
     _compute_f0_ratio,
     _compute_formant_factor,
+    _adjust_aperiodicity,
 )
 
 
@@ -180,6 +181,32 @@ class PredictWorker(QThread):
             y = self._audio.astype(np.float64 if self._audio.dtype == np.float32 else self._audio.dtype)
             duration = float(y.size / self._sr)
 
+            # 有效语音比例检测（防止刚开口时大部分是静音导致误判）
+            frame_len = int(self._sr * 0.1)
+            if frame_len >= 64 and y.size >= frame_len:
+                n_frames = y.size // frame_len
+                frame_rms = np.array([
+                    float(np.sqrt(np.mean(y[i * frame_len:(i + 1) * frame_len] ** 2)))
+                    for i in range(n_frames)
+                ])
+                active_ratio = float(np.mean(frame_rms > 0.004))
+            else:
+                active_ratio = 1.0 if float(np.sqrt(np.mean(y ** 2))) > 0.004 else 0.0
+
+            if active_ratio < 0.15:
+                self.result_ready.emit({
+                    "status": "success",
+                    "gender": "unknown",
+                    "confidence": 0,
+                    "display_features": {
+                        "mean_frequency": 0.0,
+                        "mean_pitch": 0.0,
+                        "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
+                        "duration": round(duration, 3),
+                    },
+                    "debug": {"message": "有效语音不足"},
+                })
+                return
             if self._enable_vad and not _detect_voice_activity(y, self._sr):
                 self.result_ready.emit({
                     "status": "success",
@@ -276,16 +303,17 @@ class ConvertWorker(QThread):
             voiced_f0 = f0[f0 > 0]
             mean_f0 = float(np.mean(voiced_f0)) if voiced_f0.size else 0.0
             strength = _clamp_control(strength)
-            brightness = 0.45 + strength * 0.55
+            brightness = 0.35 + strength * 0.45
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
             formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
-            f0_converted = _smooth_f0(f0 * f0_ratio, window=7)
+            f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
             sp_converted = _smooth_spectral_envelope(sp_converted, window=7)
-            y_converted = pw.synthesize(f0_converted, sp_converted, ap, sr)
+            ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+            y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
             if y_converted.size:
                 peak = float(np.max(np.abs(y_converted)))

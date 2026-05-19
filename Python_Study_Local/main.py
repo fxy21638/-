@@ -315,30 +315,30 @@ def _clamp_control(value: float, lower: float = 0.0, upper: float = 1.0) -> floa
 def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> float:
     strength = _clamp_control(strength)
     if mean_f0 <= 0:
-        return 1.45 + 0.35 * strength if target == "female" else 0.8 if target == "male" else 1.0
+        return 1.30 + 0.25 * strength if target == "female" else 0.80 if target == "male" else 1.0
     if target == "female":
-        target_f0 = 245.0 + 65.0 * strength
+        target_f0 = 215.0 + 45.0 * strength
         ratio = target_f0 / mean_f0
-        min_ratio = 1.32 + 0.18 * strength
-        max_ratio = 1.95 + 0.45 * strength
+        min_ratio = 1.22 + 0.12 * strength
+        max_ratio = 1.60 + 0.30 * strength
         return float(np.clip(ratio, min_ratio, max_ratio))
     if target == "male":
-        ratio = 95.0 / mean_f0
-        return float(np.clip(ratio, 0.5, 0.85))
+        ratio = 100.0 / mean_f0
+        return float(np.clip(ratio, 0.52, 0.88))
     return 1.0
 
 
 def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55) -> float:
     strength = _clamp_control(strength)
     if target == "female":
-        base = 1.18 + 0.16 * strength
+        base = 1.08 + 0.10 * strength
     elif target == "male":
-        base = 0.78
+        base = 0.80
     else:
         base = 1.0
-    power = 0.30 + 0.12 * strength if target == "female" else 0.45
-    max_factor = 1.36 + 0.18 * strength if target == "female" else 1.62
-    return float(np.clip(base * (f0_ratio ** power), 0.7, max_factor))
+    power = 0.22 + 0.08 * strength if target == "female" else 0.40
+    max_factor = 1.22 + 0.14 * strength if target == "female" else 1.50
+    return float(np.clip(base * (f0_ratio ** power), 0.72, max_factor))
 
 
 def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
@@ -356,21 +356,22 @@ def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarra
 def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) -> np.ndarray:
     brightness = _clamp_control(brightness)
     if target == "female":
-        low_gain = 0.97 - 0.12 * brightness
-        high_gain = 1.04 + 0.16 * brightness
+        low_gain = 0.98 - 0.05 * brightness
+        high_gain = 1.03 + 0.10 * brightness
         tilt = np.linspace(low_gain, high_gain, sp.shape[1], dtype=np.float64)
         return sp * tilt
     if target == "male":
-        tilt = np.linspace(1.06, 0.94, sp.shape[1], dtype=np.float64)
+        tilt = np.linspace(1.04, 0.96, sp.shape[1], dtype=np.float64)
         return sp * tilt
     return sp
 
 
 def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target: str, strength: float) -> np.ndarray:
-    if target != "female":
-        return sp_converted
     strength = _clamp_control(strength)
-    mix = 0.72 + 0.22 * strength
+    if target == "female":
+        mix = 0.65 + 0.18 * strength
+    else:
+        mix = 0.55 + 0.20 * strength
     return sp_original * (1.0 - mix) + sp_converted * mix
 
 
@@ -400,11 +401,19 @@ def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
     return np.exp(smoothed)
 
 
-def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.012) -> bool:
-    """
-    快速语音活动检测（基于 RMS 能量，替代慢速 pyworld.harvest）
-    安静环境噪声通常在 0.003 以下，人声通常在 0.02 以上
-    """
+def _adjust_aperiodicity(ap: np.ndarray, f0_ratio: float, target: str) -> np.ndarray:
+    """F0 变化后微调非周期性，避免过强的气息声"""
+    if f0_ratio == 1.0:
+        return ap
+    if target == "female":
+        ap = ap * 0.93
+    else:
+        ap = ap * 1.06
+    return np.clip(ap, 0.0, 1.0)
+
+
+def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
+    """快速语音活动检测（RMS 能量），阈值 0.005 适应多数麦克风"""
     if y.size == 0:
         return False
     rms = float(np.sqrt(np.mean(y ** 2)))
@@ -560,16 +569,17 @@ async def convert_voice(
         voiced_f0 = f0[f0 > 0]
         mean_f0 = float(np.mean(voiced_f0)) if voiced_f0.size else 0.0
         fem_strength = _clamp_control(fem_strength)
-        brightness = 0.45 + fem_strength * 0.55
+        brightness = 0.35 + fem_strength * 0.45
         f0_ratio = _compute_f0_ratio(mean_f0, target, fem_strength)
         formant_factor = _compute_formant_factor(target, f0_ratio, fem_strength)
 
-        f0_converted = _smooth_f0(f0 * f0_ratio, window=7)
+        f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
         sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
         sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
         sp_converted = _mix_with_original(sp, sp_converted, target, fem_strength)
         sp_converted = _smooth_spectral_envelope(sp_converted, window=7)
-        y_converted = pw.synthesize(f0_converted, sp_converted, ap, sr)
+        ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+        y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
         if y_converted.size:
             peak = float(np.max(np.abs(y_converted)))
