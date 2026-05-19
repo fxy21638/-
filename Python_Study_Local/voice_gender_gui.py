@@ -96,8 +96,6 @@ from main import (
     extract_audio_features,
     _detect_voice_activity,
     _ensure_min_duration,
-    _smooth_f0,
-    _smooth_spectral_envelope,
     _warp_spectral_envelope,
     _apply_spectral_tilt,
     _mix_with_original,
@@ -307,11 +305,10 @@ class ConvertWorker(QThread):
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
             formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
-            f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
+            f0_converted = f0 * f0_ratio
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
-            sp_converted = _smooth_spectral_envelope(sp_converted, window=7)
             ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
             y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 

@@ -317,10 +317,10 @@ def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> fl
     if mean_f0 <= 0:
         return 1.30 + 0.25 * strength if target == "female" else 0.80 if target == "male" else 1.0
     if target == "female":
-        target_f0 = 215.0 + 45.0 * strength
+        target_f0 = 220.0 + 40.0 * strength
         ratio = target_f0 / mean_f0
-        min_ratio = 1.22 + 0.12 * strength
-        max_ratio = 1.60 + 0.30 * strength
+        min_ratio = 1.28 + 0.12 * strength
+        max_ratio = 1.80 + 0.35 * strength
         return float(np.clip(ratio, min_ratio, max_ratio))
     if target == "male":
         ratio = 100.0 / mean_f0
@@ -331,13 +331,13 @@ def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> fl
 def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55) -> float:
     strength = _clamp_control(strength)
     if target == "female":
-        base = 1.08 + 0.10 * strength
+        base = 1.02 + 0.03 * strength
     elif target == "male":
-        base = 0.80
+        base = 0.88
     else:
         base = 1.0
-    power = 0.22 + 0.08 * strength if target == "female" else 0.40
-    max_factor = 1.22 + 0.14 * strength if target == "female" else 1.50
+    power = 0.08 + 0.04 * strength if target == "female" else 0.25
+    max_factor = 1.06 + 0.08 * strength if target == "female" else 1.30
     return float(np.clip(base * (f0_ratio ** power), 0.72, max_factor))
 
 
@@ -369,9 +369,9 @@ def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) 
 def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target: str, strength: float) -> np.ndarray:
     strength = _clamp_control(strength)
     if target == "female":
-        mix = 0.65 + 0.18 * strength
+        mix = 0.65 + 0.15 * strength
     else:
-        mix = 0.55 + 0.20 * strength
+        mix = 0.60 + 0.20 * strength
     return sp_original * (1.0 - mix) + sp_converted * mix
 
 
@@ -402,14 +402,8 @@ def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
 
 
 def _adjust_aperiodicity(ap: np.ndarray, f0_ratio: float, target: str) -> np.ndarray:
-    """F0 变化后微调非周期性，避免过强的气息声"""
-    if f0_ratio == 1.0:
-        return ap
-    if target == "female":
-        ap = ap * 0.93
-    else:
-        ap = ap * 1.06
-    return np.clip(ap, 0.0, 1.0)
+    """保持原始非周期性，避免引入额外的气息声或机械音"""
+    return ap
 
 
 def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
@@ -577,7 +571,7 @@ async def convert_voice(
         sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
         sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
         sp_converted = _mix_with_original(sp, sp_converted, target, fem_strength)
-        sp_converted = _smooth_spectral_envelope(sp_converted, window=7)
+        sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
         ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
         y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
