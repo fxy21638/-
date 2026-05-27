@@ -1,0 +1,14 @@
+fastapi==0.136.1
+uvicorn==0.46.0
+PySide6==6.11.0
+librosa==0.11.0
+soundfile==0.13.1
+pyworld==0.3.5
+xgboost==3.2.0
+scikit-learn==1.8.0
+matplotlib==3.10.8
+sounddevice==0.5.5
+numpy==2.4.4
+joblib==1.5.3
+scipy==1.17.1
+numba==0.65.1

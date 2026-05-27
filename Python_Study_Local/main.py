@@ -331,13 +331,13 @@ def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> fl
 def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55) -> float:
     strength = _clamp_control(strength)
     if target == "female":
-        base = 1.02 + 0.03 * strength
+        base = 1.08 + 0.10 * strength
     elif target == "male":
-        base = 0.88
+        base = 0.80
     else:
         base = 1.0
-    power = 0.08 + 0.04 * strength if target == "female" else 0.25
-    max_factor = 1.06 + 0.08 * strength if target == "female" else 1.30
+    power = 0.22 + 0.08 * strength if target == "female" else 0.40
+    max_factor = 1.22 + 0.14 * strength if target == "female" else 1.50
     return float(np.clip(base * (f0_ratio ** power), 0.72, max_factor))
 
 
@@ -369,9 +369,9 @@ def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) 
 def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target: str, strength: float) -> np.ndarray:
     strength = _clamp_control(strength)
     if target == "female":
-        mix = 0.65 + 0.15 * strength
+        mix = 0.50 + 0.15 * strength
     else:
-        mix = 0.60 + 0.20 * strength
+        mix = 0.55 + 0.20 * strength
     return sp_original * (1.0 - mix) + sp_converted * mix
 
 
