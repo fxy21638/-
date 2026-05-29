@@ -344,7 +344,7 @@ class VoiceGenderWindow(QMainWindow):
         self._full_audio_chunks: list[np.ndarray] = []
         self._first_prediction_done = False
         self._amp_history: list[float] = []
-        self._freq_history: list[float] = []
+        self._spec_image = None
 
         self._setup_ui()
         self._setup_charts()
@@ -494,19 +494,30 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_amp.set_ylim(0, 0.01)
         self.ax_amp.tick_params(labelsize=9, colors="#6b7280")
 
-        self.ax_freq = self.canvas.figure.add_subplot(2, 1, 2)
-        self.ax_freq.set_facecolor("#ffffff")
-        self.ax_freq.set_title("归一化频率", fontsize=12, fontweight="bold", color="#374151")
-        self.ax_freq.set_ylabel("归一化频率", fontsize=10, color="#6b7280")
-        self.ax_freq.set_xlabel("采样点", fontsize=10, color="#6b7280")
-        self.ax_freq.grid(True, alpha=0.2, color="#d1d5db")
-        self.ax_freq.set_xlim(0, self.MAX_CHART_POINTS)
-        self.ax_freq.set_ylim(0.03, 0.35)
-        self.ax_freq.tick_params(labelsize=9, colors="#6b7280")
+        self.ax_spec = self.canvas.figure.add_subplot(2, 1, 2)
+        self.ax_spec.set_facecolor("#1a1a2e")
+        self.ax_spec.set_title("实时语谱图 (Spectrogram)", fontsize=12, fontweight="bold", color="#374151")
+        self.ax_spec.set_ylabel("频率 (Hz)", fontsize=10, color="#6b7280")
+        self.ax_spec.set_xlabel("时间 (s)", fontsize=10, color="#6b7280")
+        self.ax_spec.tick_params(labelsize=9, colors="#6b7280")
 
         self._line_amp, = self.ax_amp.plot([], [], color="#4b5563", linewidth=1.8)
-        self._line_freq, = self.ax_freq.plot([], [], color="#5b7f95", linewidth=1.8)
-        self.canvas.figure.tight_layout()
+        self._spec_image = self.ax_spec.imshow(
+            np.zeros((10, 10)), aspect="auto", origin="lower",
+            cmap="inferno", interpolation="bilinear",
+        )
+        cbar = self.canvas.figure.colorbar(self._spec_image, ax=self.ax_spec, label="dB")
+        self.canvas.figure.tight_layout(rect=[0, 0.08, 1, 1])
+
+        guide = (
+            "读法: 横轴=时间  纵轴=频率(Hz)  亮色=能量强  |  "
+            "水平亮纹→谐波(Harmonics)  |  "
+            "深色宽带→共振峰(Formants)  |  "
+            "竖直条纹→辅音/爆破音"
+        )
+        self.canvas.figure.text(0.5, 0.01, guide, ha="center", va="bottom",
+                                fontsize=8, color="#6b7280", style="italic",
+                                bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f5", edgecolor="#dde1e7", alpha=0.9))
         self.canvas.draw_idle()
 
     def _update_amp_chart(self, amplitude: float):
@@ -521,13 +532,19 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_amp.set_xlim(-0.5, self.MAX_CHART_POINTS - 1 + 0.5)
         self.canvas.draw_idle()
 
-    def _update_freq_chart(self, frequency: float):
-        self._freq_history.append(frequency)
-        if len(self._freq_history) > self.MAX_CHART_POINTS:
-            self._freq_history.pop(0)
-        xs = list(range(len(self._freq_history)))
-        self._line_freq.set_data(xs, self._freq_history)
-        self.ax_freq.set_xlim(-0.5, self.MAX_CHART_POINTS - 1 + 0.5)
+    def _update_spectrogram(self, audio: np.ndarray):
+        n_fft = 1024
+        hop_length = 256
+        stft = np.abs(librosa.stft(audio.astype(np.float64), n_fft=n_fft, hop_length=hop_length))
+        spec_db = librosa.amplitude_to_db(stft, ref=np.max, top_db=60)
+
+        freqs = librosa.fft_frequencies(sr=self.SAMPLE_RATE, n_fft=n_fft)
+        times = librosa.frames_to_time(np.arange(spec_db.shape[1]), sr=self.SAMPLE_RATE, hop_length=hop_length)
+        voice_mask = freqs <= 4000
+
+        self._spec_image.set_data(spec_db[voice_mask, :])
+        self._spec_image.set_extent([times[0], times[-1], 0, 4000])
+        self._spec_image.set_clim(vmin=-60, vmax=0)
         self.canvas.draw_idle()
 
     # ── 样式表 ───────────────────────────────────────────────────────
@@ -706,7 +723,7 @@ class VoiceGenderWindow(QMainWindow):
     # ── 开始采集 ─────────────────────────────────────────────────────
     def _on_start(self):
         try:
-            self._ring = AudioRingBuffer(capacity_seconds=15.0, sr=self.SAMPLE_RATE)
+            self._ring = AudioRingBuffer(capacity_seconds=300.0, sr=self.SAMPLE_RATE)
             self._full_audio_for_export = None
             self._full_audio_chunks = []
             self._first_prediction_done = False
@@ -721,7 +738,6 @@ class VoiceGenderWindow(QMainWindow):
             self._stream.start()
 
             self._amp_history.clear()
-            self._freq_history.clear()
             self._clear_charts()
 
             self._chart_timer = QTimer(self)
@@ -769,6 +785,9 @@ class VoiceGenderWindow(QMainWindow):
     def _tick_chart(self):
         if self._ring is None:
             return
+        # 实时更新录制时长
+        dur = self._ring.total_samples / self.SAMPLE_RATE
+        self.rec_status.setText(f"采集中... {dur:.0f}s")
         if not self._first_prediction_done:
             return
         chunk = self._ring.get_last(0.3)
@@ -777,17 +796,11 @@ class VoiceGenderWindow(QMainWindow):
 
         amplitude = float(np.max(np.abs(chunk)))
 
-        n_fft = 2048
-        if chunk.size >= n_fft:
-            spec = np.abs(np.fft.rfft(chunk[-n_fft:]))
-            freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
-            centroid = float(np.sum(freqs * spec) / (np.sum(spec) + 1e-12))
-            mean_freq = centroid / (self.SAMPLE_RATE / 2)
-        else:
-            mean_freq = 0.0
-
         self._update_amp_chart(amplitude)
-        self._update_freq_chart(mean_freq)
+
+        spec_audio = self._ring.get_last(2.5)
+        if spec_audio is not None and spec_audio.size >= 1024:
+            self._update_spectrogram(spec_audio)
 
     # ── 定时预测 ─────────────────────────────────────────────────────
     def _tick_predict(self):
@@ -947,7 +960,7 @@ class VoiceGenderWindow(QMainWindow):
     # ── 图表清理 ─────────────────────────────────────────────────────
     def _clear_charts(self):
         self._line_amp.set_data([], [])
-        self._line_freq.set_data([], [])
+        self._spec_image.set_data(np.zeros((10, 10)))
         self.ax_amp.set_ylim(0, 0.01)
         self.canvas.draw_idle()
 
