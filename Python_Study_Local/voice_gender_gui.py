@@ -316,7 +316,7 @@ class ConvertWorker(QThread):
 # 主窗口
 # ══════════════════════════════════════════════════════════════════════════
 class VoiceGenderWindow(QMainWindow):
-    MAX_CHART_POINTS = 80
+    MAX_CHART_POINTS = 800
     CHART_INTERVAL_MS = 100
     PREDICT_INTERVAL_MS = 1500
     WINDOW_SECONDS = 3.0
@@ -348,6 +348,8 @@ class VoiceGenderWindow(QMainWindow):
         self._line_conv_spec = None
         self._preview_target: str | None = None  # "female" / "male" / None(关闭预览)
         self._preview_tick = 0
+        self._noise_floor = -40.0  # EMA-tracked noise floor for stable baseline clamping
+        self._noise_floor_conv = -40.0
 
         self._setup_ui()
         self._setup_charts()
@@ -376,26 +378,27 @@ class VoiceGenderWindow(QMainWindow):
         left.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(10)
+        left_layout.setSpacing(6)
 
         # 录制控制
         rec_group = QGroupBox("录制控制")
         rec_layout = QVBoxLayout(rec_group)
-        rec_layout.setSpacing(10)
+        rec_layout.setSpacing(6)
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(6)
         self.start_btn = QPushButton("开始采集")
-        self.start_btn.setMinimumHeight(34)
+        self.start_btn.setMinimumHeight(32)
         self.stop_btn = QPushButton("停止采集")
-        self.stop_btn.setMinimumHeight(34)
+        self.stop_btn.setMinimumHeight(32)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
         rec_layout.addLayout(btn_row)
         self.export_btn = QPushButton("导出录音 WAV")
-        self.export_btn.setMinimumHeight(30)
+        self.export_btn.setMinimumHeight(28)
         rec_layout.addWidget(self.export_btn)
         self.rec_status = QLabel("就绪")
         self.rec_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rec_status.setStyleSheet("font-size: 12px; color: #6b7280;")
         rec_layout.addWidget(self.rec_status)
         self.vad_checkbox = QCheckBox("人声检测")
         self.vad_checkbox.setChecked(True)
@@ -430,25 +433,22 @@ class VoiceGenderWindow(QMainWindow):
         conv_btn_row.addWidget(self.to_male_btn)
         conv_layout.addLayout(conv_btn_row)
 
-        # 实时预览开关
+        # 实时频谱预览
         preview_row = QHBoxLayout()
-        preview_row.setSpacing(8)
-        preview_label = QLabel("频谱预览:")
-        preview_label.setMinimumWidth(60)
-        preview_row.addWidget(preview_label)
-        self.preview_female_btn = QPushButton("预览女声")
-        self.preview_female_btn.setMinimumHeight(28)
+        preview_row.setSpacing(6)
+        self.preview_female_btn = QPushButton("频谱预览♀")
+        self.preview_female_btn.setMinimumHeight(26)
         self.preview_female_btn.setCheckable(True)
         self.preview_female_btn.setStyleSheet("""
-            QPushButton { background-color: #d1d5db; color: #374151; border-radius: 6px; font-weight: bold; }
-            QPushButton:checked { background-color: #ec4899; color: #fff; }
+            QPushButton { background-color: #e5e7eb; color: #6b7280; border-radius: 5px; font-size: 11px; }
+            QPushButton:checked { background-color: #ec4899; color: #fff; font-weight: bold; }
         """)
-        self.preview_male_btn = QPushButton("预览男声")
-        self.preview_male_btn.setMinimumHeight(28)
+        self.preview_male_btn = QPushButton("频谱预览♂")
+        self.preview_male_btn.setMinimumHeight(26)
         self.preview_male_btn.setCheckable(True)
         self.preview_male_btn.setStyleSheet("""
-            QPushButton { background-color: #d1d5db; color: #374151; border-radius: 6px; font-weight: bold; }
-            QPushButton:checked { background-color: #3b82f6; color: #fff; }
+            QPushButton { background-color: #e5e7eb; color: #6b7280; border-radius: 5px; font-size: 11px; }
+            QPushButton:checked { background-color: #3b82f6; color: #fff; font-weight: bold; }
         """)
         preview_row.addWidget(self.preview_female_btn)
         preview_row.addWidget(self.preview_male_btn)
@@ -532,22 +532,25 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_spec.set_title("实时频谱 (Frequency Spectrum)", fontsize=12, fontweight="bold", color="#374151")
         self.ax_spec.set_xlabel("频率 (Hz)", fontsize=10, color="#6b7280")
         self.ax_spec.set_ylabel("幅度 (dB)", fontsize=10, color="#6b7280")
-        self.ax_spec.set_xlim(0, 4000)
-        self.ax_spec.set_ylim(-60, 0)
+        self.ax_spec.set_xscale("log")
+        self.ax_spec.set_xlim(50, 5000)
+        self.ax_spec.set_ylim(-40, 0)
         self.ax_spec.tick_params(labelsize=9, colors="#6b7280")
-        self.ax_spec.grid(True, alpha=0.15, color="#ffffff")
+        self.ax_spec.grid(True, alpha=0.12, color="#ffffff")
 
         self._line_amp, = self.ax_amp.plot([], [], color="#4b5563", linewidth=1.8)
-        self._line_spec, = self.ax_spec.plot([], [], color="#f59e0b", linewidth=1.2, label="原始")
-        self._line_conv_spec, = self.ax_spec.plot([], [], color="#06b6d4", linewidth=1.2, label="转换后")
+        self._line_spec, = self.ax_spec.plot([], [], color="#f59e0b", linewidth=1.2, label="原始频谱")
+        self._fill_spec = None
+        self._line_conv_spec, = self.ax_spec.plot([], [], color="#06b6d4", linewidth=1.0, label="转换后")
+        self._fill_conv = None
         self.ax_spec.legend(loc="upper right", fontsize=8, labelcolor="#6b7280",
                             facecolor="#1a1a2e", edgecolor="#374151", framealpha=0.8)
 
         guide = (
             "橙色=原始频谱  青色=转换后频谱  |  "
-            "横轴=频率(Hz)  纵轴=能量(dB)  峰值→共振峰/谐波  |  "
-            "男声: 基频低(~85-180Hz) 谐波间距窄 高频弱 共振峰低  |  "
-            "女声: 基频高(~165-255Hz) 谐波间距宽 高频强 共振峰高"
+            "横轴=频率(Hz) 对数刻度  纵轴=能量(dB)  |  "
+            "尖峰=谐波  谐波间距=基频  男声谐波间距窄  女声谐波间距宽  |  "
+            "男声: 基频~85-180Hz 高频弱   女声: 基频~165-255Hz 高频强"
         )
         self.canvas.figure.text(0.5, 0.01, guide, ha="center", va="bottom",
                                 fontsize=7.5, color="#6b7280", style="italic",
@@ -580,16 +583,38 @@ class VoiceGenderWindow(QMainWindow):
         else:
             self._preview_target = None
             self._line_conv_spec.set_data([], [])
+            if self._fill_conv is not None:
+                self._fill_conv.remove()
+                self._fill_conv = None
             self.ax_spec.set_title("实时频谱 (Frequency Spectrum)", fontsize=12, fontweight="bold", color="#374151")
             self.canvas.draw_idle()
 
     def _update_spectrum(self, audio: np.ndarray):
-        n_fft = 2048
-        spec = np.abs(np.fft.rfft(audio.astype(np.float64), n=n_fft))
+        n_fft = 8192
+        if audio.size < n_fft:
+            return
+        y = audio.astype(np.float64)
+        # silence detection: RMS too low → skip update, keep previous display
+        rms = float(np.sqrt(np.mean(y ** 2)))
+        if rms < 0.003:
+            return
+        frame = y[-n_fft:]
+        window = np.hanning(n_fft)
+        spec = np.abs(np.fft.rfft(frame * window))
+        # ref=np.max(spec): correct frequency-domain reference
         spec_db = librosa.amplitude_to_db(spec, ref=np.max, top_db=60)
         freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
-        mask = freqs <= 4000
-        self._line_spec.set_data(freqs[mask], spec_db[mask])
+        spec_db = np.convolve(spec_db, np.ones(5)/5.0, mode='same')
+        # noise floor: EMA-tracked → stable flat baseline
+        current_floor = float(np.percentile(spec_db, 10))
+        self._noise_floor = 0.85 * self._noise_floor + 0.15 * current_floor
+        spec_db = np.maximum(spec_db, self._noise_floor)
+        mask = (freqs >= 50) & (freqs <= 5000)
+        x, y = freqs[mask], spec_db[mask]
+        self._line_spec.set_data(x, y)
+        if self._fill_spec is not None:
+            self._fill_spec.remove()
+        self._fill_spec = self.ax_spec.fill_between(x, -40, y, color="#f59e0b", alpha=0.35, linewidth=0)
         self.canvas.draw_idle()
 
     def _preview_convert(self, audio: np.ndarray):
@@ -625,14 +650,34 @@ class VoiceGenderWindow(QMainWindow):
                 if peak > 1.0:
                     y_conv = y_conv / peak
 
-            n_fft = 2048
-            spec_conv = np.abs(np.fft.rfft(y_conv.astype(np.float64), n=n_fft))
-            spec_conv_db = librosa.amplitude_to_db(spec_conv, ref=np.max, top_db=60)
+            n_fft = 4096
+            conv_audio = y_conv.astype(np.float64)
+            if conv_audio.size < n_fft:
+                self._line_conv_spec.set_data([], [])
+                if self._fill_conv is not None:
+                    self._fill_conv.remove()
+                    self._fill_conv = None
+                return
+            frame = conv_audio[-n_fft:]
+            window = np.hanning(n_fft)
+            spec = np.abs(np.fft.rfft(frame * window))
+            spec_conv_db = librosa.amplitude_to_db(spec, ref=np.max, top_db=60)
+            spec_conv_db = np.convolve(spec_conv_db, np.ones(7)/7.0, mode='same')
+            current_floor = float(np.percentile(spec_conv_db, 10))
+            self._noise_floor_conv = 0.85 * self._noise_floor_conv + 0.15 * current_floor
+            spec_conv_db = np.maximum(spec_conv_db, self._noise_floor_conv)
             freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
-            mask = freqs <= 4000
-            self._line_conv_spec.set_data(freqs[mask], spec_conv_db[mask])
+            mask = (freqs >= 50) & (freqs <= 5000)
+            xc, yc = freqs[mask], spec_conv_db[mask]
+            self._line_conv_spec.set_data(xc, yc)
+            if self._fill_conv is not None:
+                self._fill_conv.remove()
+            self._fill_conv = self.ax_spec.fill_between(xc, -40, yc, color="#06b6d4", alpha=0.30, linewidth=0)
         except Exception:
             self._line_conv_spec.set_data([], [])
+            if self._fill_conv is not None:
+                self._fill_conv.remove()
+                self._fill_conv = None
 
     # ── 样式表 ───────────────────────────────────────────────────────
     def _setup_style(self):
@@ -825,6 +870,8 @@ class VoiceGenderWindow(QMainWindow):
             self._stream.start()
 
             self._amp_history.clear()
+            self._noise_floor = -40.0
+            self._noise_floor_conv = -40.0
             self._clear_charts()
 
             self._chart_timer = QTimer(self)
@@ -879,9 +926,10 @@ class VoiceGenderWindow(QMainWindow):
             return
         # 实时更新录制时长
         dur = self._ring.total_samples / self.SAMPLE_RATE
-        self.rec_status.setText(f"采集中... {dur:.0f}s")
         if not self._first_prediction_done:
+            self.rec_status.setText(f"采集中... {dur:.0f}s | 预测准备中...")
             return
+        self.rec_status.setText(f"采集中... {dur:.0f}s")
         chunk = self._ring.get_last(0.3)
         if chunk is None or chunk.size == 0:
             return
@@ -890,7 +938,7 @@ class VoiceGenderWindow(QMainWindow):
 
         self._update_amp_chart(amplitude)
 
-        spec_audio = self._ring.get_last(0.3)
+        spec_audio = self._ring.get_last(0.4)
         if spec_audio is not None and spec_audio.size >= 256:
             self._update_spectrum(spec_audio)
             # 实时预览转换(每300ms运行一次, 避免阻塞)
@@ -953,8 +1001,10 @@ class VoiceGenderWindow(QMainWindow):
     def _on_export(self):
         if self._full_audio_for_export is None or self._full_audio_for_export.size == 0:
             return
+        rec_dir = str(Path(__file__).resolve().parent.parent / "recordings")
+        Path(rec_dir).mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出录音", "recording.wav", "WAV 文件 (*.wav)"
+            self, "导出录音", f"{rec_dir}/recording.wav", "WAV 文件 (*.wav)"
         )
         if not path:
             return
@@ -969,8 +1019,10 @@ class VoiceGenderWindow(QMainWindow):
         if self._full_audio_for_export is None or self._full_audio_for_export.size == 0:
             return
         default_name = "converted_female.wav" if target == "female" else "converted_male.wav"
+        rec_dir = str(Path(__file__).resolve().parent.parent / "recordings")
+        Path(rec_dir).mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存转换结果", default_name, "WAV 文件 (*.wav)"
+            self, "保存转换结果", f"{rec_dir}/{default_name}", "WAV 文件 (*.wav)"
         )
         if not path:
             return
@@ -1059,6 +1111,12 @@ class VoiceGenderWindow(QMainWindow):
         self._line_amp.set_data([], [])
         self._line_spec.set_data([], [])
         self._line_conv_spec.set_data([], [])
+        if self._fill_spec is not None:
+            self._fill_spec.remove()
+            self._fill_spec = None
+        if self._fill_conv is not None:
+            self._fill_conv.remove()
+            self._fill_conv = None
         self.ax_amp.set_ylim(0, 0.01)
         self.canvas.draw_idle()
 
