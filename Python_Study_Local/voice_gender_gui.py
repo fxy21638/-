@@ -94,7 +94,6 @@ def _load_model():
 # ── 从 main.py 导入特征提取等纯函数 ────────────────────────────────────
 from main import (
     extract_audio_features,
-    _detect_voice_activity,
     _ensure_min_duration,
     _smooth_f0,
     _smooth_spectral_envelope,
@@ -181,46 +180,33 @@ class PredictWorker(QThread):
             y = self._audio.astype(np.float64 if self._audio.dtype == np.float32 else self._audio.dtype)
             duration = float(y.size / self._sr)
 
-            # 有效语音比例检测（防止刚开口时大部分是静音导致误判）
-            frame_len = int(self._sr * 0.1)
-            if frame_len >= 64 and y.size >= frame_len:
-                n_frames = y.size // frame_len
-                frame_rms = np.array([
-                    float(np.sqrt(np.mean(y[i * frame_len:(i + 1) * frame_len] ** 2)))
-                    for i in range(n_frames)
-                ])
-                active_ratio = float(np.mean(frame_rms > 0.004))
-            else:
-                active_ratio = 1.0 if float(np.sqrt(np.mean(y ** 2))) > 0.004 else 0.0
+            # 人声检测：分帧统计有效语音比例，避免静音/杂音误判
+            if self._enable_vad:
+                frame_len = int(self._sr * 0.1)
+                if frame_len >= 64 and y.size >= frame_len:
+                    n_frames = y.size // frame_len
+                    frame_rms = np.array([
+                        float(np.sqrt(np.mean(y[i * frame_len:(i + 1) * frame_len] ** 2)))
+                        for i in range(n_frames)
+                    ])
+                    active_ratio = float(np.mean(frame_rms > 0.005))
+                else:
+                    active_ratio = 1.0 if float(np.sqrt(np.mean(y ** 2))) > 0.005 else 0.0
 
-            if active_ratio < 0.15:
-                self.result_ready.emit({
-                    "status": "success",
-                    "gender": "unknown",
-                    "confidence": 0,
-                    "display_features": {
-                        "mean_frequency": 0.0,
-                        "mean_pitch": 0.0,
-                        "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
-                        "duration": round(duration, 3),
-                    },
-                    "debug": {"message": "有效语音不足"},
-                })
-                return
-            if self._enable_vad and not _detect_voice_activity(y, self._sr):
-                self.result_ready.emit({
-                    "status": "success",
-                    "gender": "unknown",
-                    "confidence": 0,
-                    "display_features": {
-                        "mean_frequency": 0.0,
-                        "mean_pitch": 0.0,
-                        "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
-                        "duration": round(duration, 3),
-                    },
-                    "debug": {"message": "未检测到人声"},
-                })
-                return
+                if active_ratio < 0.10:
+                    self.result_ready.emit({
+                        "status": "success",
+                        "gender": "unknown",
+                        "confidence": 0,
+                        "display_features": {
+                            "mean_frequency": 0.0,
+                            "mean_pitch": 0.0,
+                            "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
+                            "duration": round(duration, 3),
+                        },
+                        "debug": {"message": "未检测到足够人声"},
+                    })
+                    return
 
             model, feature_names, label_mapping = _load_model()
             y_for_feature = _ensure_min_duration(y, self._sr, min_duration=1.2)
@@ -330,9 +316,10 @@ class ConvertWorker(QThread):
 # 主窗口
 # ══════════════════════════════════════════════════════════════════════════
 class VoiceGenderWindow(QMainWindow):
-    MAX_CHART_POINTS = 30
-    PREDICT_INTERVAL_MS = 2000
-    WINDOW_SECONDS = 5.0
+    MAX_CHART_POINTS = 80
+    CHART_INTERVAL_MS = 100
+    PREDICT_INTERVAL_MS = 1500
+    WINDOW_SECONDS = 3.0
     SAMPLE_RATE = 22050
 
     _warmup_done = Signal()
@@ -347,12 +334,15 @@ class VoiceGenderWindow(QMainWindow):
         self._ring: AudioRingBuffer | None = None
         self._stream: sd.InputStream | None = None
         self._predict_timer: QTimer | None = None
+        self._chart_timer: QTimer | None = None
         self._predict_worker: PredictWorker | None = None
         self._convert_worker: ConvertWorker | None = None
         self._upload_worker: PredictWorker | None = None
         self._warmed_up = False
         self._ui_ready = False
         self._full_audio_for_export: np.ndarray | None = None
+        self._full_audio_chunks: list[np.ndarray] = []
+        self._first_prediction_done = False
         self._amp_history: list[float] = []
         self._freq_history: list[float] = []
 
@@ -511,7 +501,7 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_freq.set_xlabel("采样点", fontsize=10, color="#6b7280")
         self.ax_freq.grid(True, alpha=0.2, color="#d1d5db")
         self.ax_freq.set_xlim(0, self.MAX_CHART_POINTS)
-        self.ax_freq.set_ylim(0.03, 0.28)
+        self.ax_freq.set_ylim(0.03, 0.35)
         self.ax_freq.tick_params(labelsize=9, colors="#6b7280")
 
         self._line_amp, = self.ax_amp.plot([], [], color="#4b5563", linewidth=1.8)
@@ -519,24 +509,25 @@ class VoiceGenderWindow(QMainWindow):
         self.canvas.figure.tight_layout()
         self.canvas.draw_idle()
 
-    def _update_charts(self, amplitude: float, frequency: float):
+    def _update_amp_chart(self, amplitude: float):
         self._amp_history.append(amplitude)
-        self._freq_history.append(frequency)
         if len(self._amp_history) > self.MAX_CHART_POINTS:
             self._amp_history.pop(0)
-            self._freq_history.pop(0)
-
         xs = list(range(len(self._amp_history)))
         self._line_amp.set_data(xs, self._amp_history)
-        self._line_freq.set_data(xs, self._freq_history)
-
-        # 动态调整幅度轴
         if self._amp_history:
             amp_max = max(max(self._amp_history) * 1.3, 0.01)
             self.ax_amp.set_ylim(0, amp_max)
+        self.ax_amp.set_xlim(-0.5, self.MAX_CHART_POINTS - 1 + 0.5)
+        self.canvas.draw_idle()
 
-        self.ax_amp.set_xlim(-0.5, max(self.MAX_CHART_POINTS - 1, len(xs) - 1) + 0.5)
-        self.ax_freq.set_xlim(-0.5, max(self.MAX_CHART_POINTS - 1, len(xs) - 1) + 0.5)
+    def _update_freq_chart(self, frequency: float):
+        self._freq_history.append(frequency)
+        if len(self._freq_history) > self.MAX_CHART_POINTS:
+            self._freq_history.pop(0)
+        xs = list(range(len(self._freq_history)))
+        self._line_freq.set_data(xs, self._freq_history)
+        self.ax_freq.set_xlim(-0.5, self.MAX_CHART_POINTS - 1 + 0.5)
         self.canvas.draw_idle()
 
     # ── 样式表 ───────────────────────────────────────────────────────
@@ -708,13 +699,17 @@ class VoiceGenderWindow(QMainWindow):
         if status:
             print(f"[audio] {status}")
         if self._ring is not None:
-            self._ring.write(indata[:, 0].copy())
+            chunk = indata[:, 0].copy()
+            self._ring.write(chunk)
+            self._full_audio_chunks.append(chunk)
 
     # ── 开始采集 ─────────────────────────────────────────────────────
     def _on_start(self):
         try:
             self._ring = AudioRingBuffer(capacity_seconds=15.0, sr=self.SAMPLE_RATE)
             self._full_audio_for_export = None
+            self._full_audio_chunks = []
+            self._first_prediction_done = False
 
             self._stream = sd.InputStream(
                 samplerate=self.SAMPLE_RATE,
@@ -729,6 +724,10 @@ class VoiceGenderWindow(QMainWindow):
             self._freq_history.clear()
             self._clear_charts()
 
+            self._chart_timer = QTimer(self)
+            self._chart_timer.timeout.connect(self._tick_chart)
+            self._chart_timer.start(self.CHART_INTERVAL_MS)
+
             self._predict_timer = QTimer(self)
             self._predict_timer.timeout.connect(self._tick_predict)
             self._predict_timer.start(self.PREDICT_INTERVAL_MS)
@@ -741,6 +740,10 @@ class VoiceGenderWindow(QMainWindow):
 
     # ── 停止采集 ─────────────────────────────────────────────────────
     def _on_stop(self):
+        if self._chart_timer:
+            self._chart_timer.stop()
+            self._chart_timer = None
+
         if self._predict_timer:
             self._predict_timer.stop()
             self._predict_timer = None
@@ -750,14 +753,41 @@ class VoiceGenderWindow(QMainWindow):
             self._stream.close()
             self._stream = None
 
-        if self._ring:
+        if self._full_audio_chunks:
+            self._full_audio_for_export = np.concatenate(self._full_audio_chunks)
+        elif self._ring:
             self._full_audio_for_export = self._ring.get_full()
+        if self._ring:
             self._ring = None
 
         self._update_button_states("stopped")
         dur = float(self._full_audio_for_export.size / self.SAMPLE_RATE) if self._full_audio_for_export is not None else 0
         self.rec_status.setText(f"已停止 — 录制 {dur:.1f}s")
         self.statusBar().showMessage(f"采集停止，共 {dur:.1f} 秒")
+
+    # ── 高速图表刷新（每 100ms 直接从缓冲区取幅值+频率）─────────────
+    def _tick_chart(self):
+        if self._ring is None:
+            return
+        if not self._first_prediction_done:
+            return
+        chunk = self._ring.get_last(0.3)
+        if chunk is None or chunk.size == 0:
+            return
+
+        amplitude = float(np.max(np.abs(chunk)))
+
+        n_fft = 2048
+        if chunk.size >= n_fft:
+            spec = np.abs(np.fft.rfft(chunk[-n_fft:]))
+            freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
+            centroid = float(np.sum(freqs * spec) / (np.sum(spec) + 1e-12))
+            mean_freq = centroid / (self.SAMPLE_RATE / 2)
+        else:
+            mean_freq = 0.0
+
+        self._update_amp_chart(amplitude)
+        self._update_freq_chart(mean_freq)
 
     # ── 定时预测 ─────────────────────────────────────────────────────
     def _tick_predict(self):
@@ -775,6 +805,7 @@ class VoiceGenderWindow(QMainWindow):
         self._predict_worker.start()
 
     def _on_prediction_result(self, result: dict):
+        self._first_prediction_done = True
         gender = result.get("gender", "unknown")
         if gender == "unknown":
             self.gender_label.setText("未检测到人声")
@@ -782,9 +813,6 @@ class VoiceGenderWindow(QMainWindow):
         else:
             self.gender_label.setText(gender)
             self.confidence_label.setText(f"置信度：{result['confidence']}%")
-
-        df = result.get("display_features", {})
-        self._update_charts(df.get("amplitude", 0.0), df.get("mean_frequency", 0.0))
 
         # 调试信息
         dbg = result.get("debug", {})
@@ -925,6 +953,8 @@ class VoiceGenderWindow(QMainWindow):
 
     # ── 窗口关闭 ─────────────────────────────────────────────────────
     def closeEvent(self, event):
+        if self._chart_timer:
+            self._chart_timer.stop()
         if self._predict_timer:
             self._predict_timer.stop()
         if self._stream:

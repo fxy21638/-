@@ -315,16 +315,23 @@ def _clamp_control(value: float, lower: float = 0.0, upper: float = 1.0) -> floa
 def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> float:
     strength = _clamp_control(strength)
     if mean_f0 <= 0:
-        return 1.30 + 0.25 * strength if target == "female" else 0.80 if target == "male" else 1.0
+        if target == "female":
+            return 1.40 + 0.35 * strength
+        elif target == "male":
+            return 0.82 - 0.15 * strength
+        return 1.0
     if target == "female":
-        target_f0 = 220.0 + 40.0 * strength
+        target_f0 = 210.0 + 80.0 * strength
         ratio = target_f0 / mean_f0
-        min_ratio = 1.28 + 0.12 * strength
-        max_ratio = 1.80 + 0.35 * strength
+        min_ratio = 0.95
+        max_ratio = 1.50 + 0.55 * strength
         return float(np.clip(ratio, min_ratio, max_ratio))
     if target == "male":
-        ratio = 100.0 / mean_f0
-        return float(np.clip(ratio, 0.52, 0.88))
+        target_f0 = 130.0 - 45.0 * strength
+        ratio = target_f0 / mean_f0
+        min_ratio = 0.85 - 0.30 * strength
+        max_ratio = 1.05
+        return float(np.clip(ratio, min_ratio, max_ratio))
     return 1.0
 
 
@@ -332,13 +339,20 @@ def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55
     strength = _clamp_control(strength)
     if target == "female":
         base = 1.08 + 0.10 * strength
+        power = 0.22 + 0.08 * strength
+        min_factor = 0.80
+        max_factor = 1.22 + 0.14 * strength
     elif target == "male":
-        base = 0.80
+        base = 0.95 - 0.12 * strength
+        power = 0.35 + 0.10 * strength
+        min_factor = 0.78 - 0.15 * strength
+        max_factor = 1.20
     else:
         base = 1.0
-    power = 0.22 + 0.08 * strength if target == "female" else 0.40
-    max_factor = 1.22 + 0.14 * strength if target == "female" else 1.50
-    return float(np.clip(base * (f0_ratio ** power), 0.72, max_factor))
+        power = 0.30
+        min_factor = 0.75
+        max_factor = 1.30
+    return float(np.clip(base * (f0_ratio ** power), min_factor, max_factor))
 
 
 def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
@@ -361,25 +375,38 @@ def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) 
         tilt = np.linspace(low_gain, high_gain, sp.shape[1], dtype=np.float64)
         return sp * tilt
     if target == "male":
-        tilt = np.linspace(1.04, 0.96, sp.shape[1], dtype=np.float64)
+        low_gain = 1.00 + 0.05 * brightness
+        high_gain = 0.99 - 0.06 * brightness
+        tilt = np.linspace(low_gain, high_gain, sp.shape[1], dtype=np.float64)
         return sp * tilt
     return sp
 
 
 def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target: str, strength: float) -> np.ndarray:
+    """频率自适应的频谱混合：低频保留原声（保持音色），高频使用转换（调整音高感受）"""
     strength = _clamp_control(strength)
+    n_bins = sp_original.shape[1]
+
+    mix_base = np.linspace(0.20, 0.65, n_bins, dtype=np.float64)
+    mix_ratio = mix_base + strength * 0.25
+
     if target == "female":
-        mix = 0.50 + 0.15 * strength
-    else:
-        mix = 0.55 + 0.20 * strength
-    return sp_original * (1.0 - mix) + sp_converted * mix
+        mix_ratio += 0.03
+    elif target == "male":
+        mix_ratio -= 0.02
+
+    mix_ratio = np.clip(mix_ratio, 0.18, 0.85)
+    return sp_original * (1.0 - mix_ratio) + sp_converted * mix_ratio
 
 
 def _smooth_f0(f0: np.ndarray, window: int = 5) -> np.ndarray:
+    """多阶段F0平滑，减少基频跳变导致的电音"""
     if window <= 1:
         return f0
     half = window // 2
     smoothed = f0.copy()
+    
+    # 第一阶段：中值滤波（移除离群值）
     for idx in range(f0.size):
         start = max(0, idx - half)
         end = min(f0.size, idx + half + 1)
@@ -387,23 +414,69 @@ def _smooth_f0(f0: np.ndarray, window: int = 5) -> np.ndarray:
         voiced = voiced[voiced > 0]
         if voiced.size:
             smoothed[idx] = float(np.median(voiced))
+    
+    # 第二阶段：局部线性插值（保证连贯性）
+    voiced_mask = smoothed > 0
+    if np.any(voiced_mask):
+        voiced_indices = np.where(voiced_mask)[0]
+        if len(voiced_indices) > 1:
+            # 对有声段进行细致的连贯处理
+            for seg_start_idx in range(len(voiced_indices) - 1):
+                idx_a = voiced_indices[seg_start_idx]
+                idx_b = voiced_indices[seg_start_idx + 1]
+                if idx_b - idx_a <= 6:
+                    smoothed[idx_a:idx_b + 1] = np.linspace(smoothed[idx_a], smoothed[idx_b], idx_b - idx_a + 1)
+    
     return smoothed
 
 
 def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
+    """两步频谱平滑，保留清晰度同时减少噪声"""
     if window <= 1:
         return sp
-    kernel = np.ones(window, dtype=np.float64) / window
+    
+    # 第一阶段：频率维度平滑（倒谱平滑）
     log_sp = np.log(sp + 1e-12)
+    kernel = np.ones(window, dtype=np.float64) / window
+    
     smoothed = np.empty_like(log_sp)
     for idx in range(log_sp.shape[0]):
         smoothed[idx] = np.convolve(log_sp[idx], kernel, mode="same")
+    
+    # 第二阶段：时间维度平滑（避免帧间的剧烈跳变）
+    if smoothed.shape[0] > 1:
+        kernel_time = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+        smoothed_time = np.zeros_like(smoothed)
+        smoothed_time[0] = smoothed[0]
+        for frame_idx in range(1, smoothed.shape[0] - 1):
+            smoothed_time[frame_idx] = (
+                0.25 * smoothed[frame_idx - 1] +
+                0.5 * smoothed[frame_idx] +
+                0.25 * smoothed[frame_idx + 1]
+            )
+        smoothed_time[-1] = smoothed[-1]
+        smoothed = smoothed_time
+    
     return np.exp(smoothed)
 
 
 def _adjust_aperiodicity(ap: np.ndarray, f0_ratio: float, target: str) -> np.ndarray:
-    """保持原始非周期性，避免引入额外的气息声或机械音"""
-    return ap
+    """根据音高变化幅度调整非周期性，使合成更自然"""
+    adjusted = ap.copy()
+    n_bins = ap.shape[1]
+
+    if target == "female":
+        intensity = float(np.clip((f0_ratio - 1.0) / 1.2, 0.0, 1.0))
+        hf_boost = 1.0 + 0.10 * intensity
+        hf_mask = np.linspace(1.0, hf_boost, n_bins)
+        adjusted = ap * hf_mask
+    elif target == "male":
+        intensity = float(np.clip((1.0 - f0_ratio) / 0.6, 0.0, 1.0))
+        hf_cut = 1.0 - 0.10 * intensity
+        hf_mask = np.linspace(1.0, hf_cut, n_bins)
+        adjusted = ap * hf_mask
+
+    return np.clip(adjusted, 0.0, 1.0)
 
 
 def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
