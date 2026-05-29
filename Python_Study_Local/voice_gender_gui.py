@@ -104,6 +104,7 @@ from main import (
     _compute_f0_ratio,
     _compute_formant_factor,
     _adjust_aperiodicity,
+    _trim_silence,
 )
 
 
@@ -209,7 +210,8 @@ class PredictWorker(QThread):
                     return
 
             model, feature_names, label_mapping = _load_model()
-            y_for_feature = _ensure_min_duration(y, self._sr, min_duration=1.2)
+            y_trimmed = _trim_silence(y, self._sr)
+            y_for_feature = _ensure_min_duration(y_trimmed, self._sr, min_duration=1.2)
             feature_df = extract_audio_features(y_for_feature, self._sr, feature_names)
 
             raw_proba = model.predict_proba(feature_df)[0]
@@ -240,6 +242,11 @@ class PredictWorker(QThread):
                     if val < ref_min * 0.5 or val > ref_max * 1.5:
                         outliers.append(f"{col}={val:.4f}(ref:[{ref_min:.4f},{ref_max:.4f}])")
 
+            # 附加辅助特征到调试信息
+            aux_features = {}
+            for k in ["fun_range", "freq_fun_ratio", "low_energy_ratio"]:
+                if k in feature_df.columns:
+                    aux_features[k] = round(float(feature_df[k].iloc[0]), 4)
             result = {
                 "status": "success",
                 "gender": predicted_gender,
@@ -251,6 +258,7 @@ class PredictWorker(QThread):
                     "duration": f"{duration:.1f}s",
                     "features": all_features,
                     "outliers": outliers,
+                    "aux_features": aux_features,
                 },
             }
             self.result_ready.emit(result)
@@ -293,12 +301,12 @@ class ConvertWorker(QThread):
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
             formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
-            f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
+            f0_converted = _smooth_f0(f0 * f0_ratio)
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
             sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
-            ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+            ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
             y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
             if y_converted.size:
@@ -594,10 +602,6 @@ class VoiceGenderWindow(QMainWindow):
         if audio.size < n_fft:
             return
         y = audio.astype(np.float64)
-        # silence detection: RMS too low → skip update, keep previous display
-        rms = float(np.sqrt(np.mean(y ** 2)))
-        if rms < 0.003:
-            return
         frame = y[-n_fft:]
         window = np.hanning(n_fft)
         spec = np.abs(np.fft.rfft(frame * window))
@@ -637,12 +641,12 @@ class VoiceGenderWindow(QMainWindow):
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
             formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
-            f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
+            f0_converted = _smooth_f0(f0 * f0_ratio)
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
             sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
-            ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+            ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
             y_conv = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
             if y_conv.size:
@@ -831,6 +835,9 @@ class VoiceGenderWindow(QMainWindow):
     def _warmup_model(self):
         try:
             _load_model()
+            # 预热 librosa.yin 的 Numba JIT 编译，避免首次预测等待 5-10s
+            _warmup = np.random.randn(22050).astype(np.float32)
+            librosa.yin(_warmup, fmin=50, fmax=500, sr=22050)
             self._warmup_msg = "模型加载完成 - 就绪"
         except Exception as e:
             self._warmup_msg = f"模型预热失败，将在首次预测时重试: {e}"
@@ -924,12 +931,11 @@ class VoiceGenderWindow(QMainWindow):
     def _tick_chart(self):
         if self._ring is None:
             return
-        # 实时更新录制时长
         dur = self._ring.total_samples / self.SAMPLE_RATE
         if not self._first_prediction_done:
             self.rec_status.setText(f"采集中... {dur:.0f}s | 预测准备中...")
-            return
-        self.rec_status.setText(f"采集中... {dur:.0f}s")
+        else:
+            self.rec_status.setText(f"采集中... {dur:.0f}s")
         chunk = self._ring.get_last(0.3)
         if chunk is None or chunk.size == 0:
             return
@@ -986,6 +992,9 @@ class VoiceGenderWindow(QMainWindow):
                         "meandom", "mindom", "maxdom", "modindx", "skew", "kurt"]
                 line = "特征: " + " ".join(f"{k}={feats[k]}" for k in keys if k in feats)
                 lines.append(line)
+            aux = dbg.get("aux_features", {})
+            if aux:
+                lines.append("辅助: " + " ".join(f"{k}={v}" for k, v in aux.items()))
             outliers = dbg.get("outliers", [])
             if outliers:
                 lines.append("[异常] " + ", ".join(outliers))

@@ -233,48 +233,6 @@ def extract_audio_features(y: np.ndarray, sr: int, feature_names: list) -> pd.Da
     return pd.DataFrame([features])[feature_names]
 
 
-def _infer_gender_with_short_audio_guard(
-    feature_df: pd.DataFrame,
-    pred_label: int,
-    pred_prob: float,
-    duration: float,
-    label_mapping: dict,
-) -> tuple[str, float]:
-    pred_gender_cn = str(label_mapping.get(pred_label, pred_label))
-    pred_gender = GENDER_MAP.get(pred_gender_cn, pred_gender_cn)
-    mean_pitch = float(feature_df["meanfun"].iloc[0]) if "meanfun" in feature_df else 0.0
-    mean_frequency = float(feature_df["meanfreq"].iloc[0]) if "meanfreq" in feature_df else 0.0
-
-    short_audio = duration < 1.0
-    low_confidence = pred_prob < 0.78
-    female_cues = 0
-    male_cues = 0
-
-    # 阈值基于归一化后的值：
-    # mean_pitch = meanfun/1000, 男~0.11, 女~0.17
-    # mean_frequency = meanfreq/nyquist, 男~0.17, 女~0.19
-    if mean_pitch >= 0.195:
-        female_cues += 2
-    elif mean_pitch >= 0.165:
-        female_cues += 1
-
-    if 0 < mean_pitch <= 0.135:
-        male_cues += 2
-    elif 0 < mean_pitch <= 0.155:
-        male_cues += 1
-
-    if mean_frequency >= 0.200:
-        female_cues += 1
-    elif 0 < mean_frequency <= 0.135:
-        male_cues += 1
-
-    if (short_audio or low_confidence) and female_cues >= male_cues + 2:
-        return "女性", max(pred_prob, 0.82 if short_audio else 0.78)
-    if (short_audio or low_confidence) and male_cues >= female_cues + 2:
-        return "男性", max(pred_prob, 0.82 if short_audio else 0.78)
-    return pred_gender, pred_prob
-
-
 def _smooth_prediction(current_gender: str, current_prob: float) -> tuple[str, float]:
     """
     简单多数投票平滑：最近 5 次中出现次数最多的性别即为输出。
@@ -306,6 +264,14 @@ def _smooth_prediction(current_gender: str, current_prob: float) -> tuple[str, f
     avg_prob = total_prob / len(_prediction_history["buffer"])
 
     return most_common, avg_prob
+
+
+def _trim_silence(y: np.ndarray, sr: int, top_db: int = 28) -> np.ndarray:
+    """裁剪首尾静音，避免 WORLD 在无声段产生杂音"""
+    if y.size == 0:
+        return y
+    y_trimmed, _ = librosa.effects.trim(y, top_db=top_db)
+    return y_trimmed if y_trimmed.size > 0 else y
 
 
 def _clamp_control(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -356,6 +322,7 @@ def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55
 
 
 def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
+    """频域拉伸共振峰，混入原声保留音色，避免过度扭曲"""
     if factor == 1.0:
         return sp
     n_frames, n_bins = sp.shape
@@ -364,7 +331,10 @@ def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarra
     warped = np.empty_like(sp)
     for idx in range(n_frames):
         warped[idx] = np.interp(freqs, src_freqs, sp[idx], left=sp[idx, 0], right=sp[idx, -1])
-    return warped
+    # 混入 30% 原声，保留自然音色
+    blend = 0.30 + 0.40 * abs(factor - 1.0)
+    blend = min(blend, 0.70)
+    return sp * (1.0 - blend) + warped * blend
 
 
 def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) -> np.ndarray:
@@ -399,14 +369,14 @@ def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target
     return sp_original * (1.0 - mix_ratio) + sp_converted * mix_ratio
 
 
-def _smooth_f0(f0: np.ndarray, window: int = 5) -> np.ndarray:
-    """多阶段F0平滑，减少基频跳变导致的电音"""
+def _smooth_f0(f0: np.ndarray, window: int = 7) -> np.ndarray:
+    """三阶段F0平滑：中值去野 → 低通消阶梯 → 插值填空洞，减少电音"""
     if window <= 1:
         return f0
     half = window // 2
     smoothed = f0.copy()
-    
-    # 第一阶段：中值滤波（移除离群值）
+
+    # 阶段1：中值滤波（移除离群值），窗口加大到7
     for idx in range(f0.size):
         start = max(0, idx - half)
         end = min(f0.size, idx + half + 1)
@@ -414,19 +384,31 @@ def _smooth_f0(f0: np.ndarray, window: int = 5) -> np.ndarray:
         voiced = voiced[voiced > 0]
         if voiced.size:
             smoothed[idx] = float(np.median(voiced))
-    
-    # 第二阶段：局部线性插值（保证连贯性）
+
+    # 阶段2：有声段移动平均低通，消除中值滤波的阶梯状（机械电音主因）
     voiced_mask = smoothed > 0
     if np.any(voiced_mask):
-        voiced_indices = np.where(voiced_mask)[0]
-        if len(voiced_indices) > 1:
-            # 对有声段进行细致的连贯处理
-            for seg_start_idx in range(len(voiced_indices) - 1):
-                idx_a = voiced_indices[seg_start_idx]
-                idx_b = voiced_indices[seg_start_idx + 1]
-                if idx_b - idx_a <= 6:
-                    smoothed[idx_a:idx_b + 1] = np.linspace(smoothed[idx_a], smoothed[idx_b], idx_b - idx_a + 1)
-    
+        smoothed_ma = smoothed.copy()
+        for idx in range(smoothed.size):
+            start = max(0, idx - 2)
+            end = min(smoothed.size, idx + 3)
+            neighborhood = smoothed[start:end]
+            voiced_neighbors = neighborhood[neighborhood > 0]
+            if voiced_neighbors.size >= 2:
+                smoothed_ma[idx] = float(np.mean(voiced_neighbors))
+        # 只在有声段应用低通结果
+        smoothed[voiced_mask] = smoothed_ma[voiced_mask]
+
+    # 阶段3：局部线性插值（填充短空洞，扩大范围到10帧）
+    voiced_indices = np.where(smoothed > 0)[0]
+    if len(voiced_indices) > 1:
+        for seg_start_idx in range(len(voiced_indices) - 1):
+            idx_a = voiced_indices[seg_start_idx]
+            idx_b = voiced_indices[seg_start_idx + 1]
+            if idx_b - idx_a <= 10:
+                smoothed[idx_a:idx_b + 1] = np.linspace(
+                    smoothed[idx_a], smoothed[idx_b], idx_b - idx_a + 1)
+
     return smoothed
 
 
@@ -460,21 +442,25 @@ def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
     return np.exp(smoothed)
 
 
-def _adjust_aperiodicity(ap: np.ndarray, f0_ratio: float, target: str) -> np.ndarray:
-    """根据音高变化幅度调整非周期性，使合成更自然"""
+def _adjust_aperiodicity(ap: np.ndarray, f0: np.ndarray, f0_ratio: float, target: str) -> np.ndarray:
+    """仅调整有声帧的非周期性，无声帧保持原样（避免呼吸/尾音被合成成杂音）"""
     adjusted = ap.copy()
     n_bins = ap.shape[1]
+    voiced_mask = f0 > 0  # 仅处理有声帧
+
+    if not np.any(voiced_mask):
+        return adjusted
 
     if target == "female":
         intensity = float(np.clip((f0_ratio - 1.0) / 1.2, 0.0, 1.0))
-        hf_boost = 1.0 + 0.10 * intensity
+        hf_boost = 1.0 + 0.06 * intensity
         hf_mask = np.linspace(1.0, hf_boost, n_bins)
-        adjusted = ap * hf_mask
+        adjusted[voiced_mask] = ap[voiced_mask] * hf_mask
     elif target == "male":
         intensity = float(np.clip((1.0 - f0_ratio) / 0.6, 0.0, 1.0))
-        hf_cut = 1.0 - 0.10 * intensity
+        hf_cut = 1.0 - 0.06 * intensity
         hf_mask = np.linspace(1.0, hf_cut, n_bins)
-        adjusted = ap * hf_mask
+        adjusted[voiced_mask] = ap[voiced_mask] * hf_mask
 
     return np.clip(adjusted, 0.0, 1.0)
 
@@ -628,6 +614,8 @@ async def convert_voice(
     try:
         y, sr = librosa.load(temp_audio_path, sr=22050, mono=True)
         y = y.astype(np.float64)
+        # 裁剪首尾静音，避免 WORLD 在无声段产生杂音和尾音
+        y = _trim_silence(y, sr)
         f0, t = pw.harvest(y, sr, f0_floor=50.0, f0_ceil=500.0)
         f0 = pw.stonemask(y, f0, t, sr)
         sp = pw.cheaptrick(y, f0, t, sr)
@@ -640,12 +628,12 @@ async def convert_voice(
         f0_ratio = _compute_f0_ratio(mean_f0, target, fem_strength)
         formant_factor = _compute_formant_factor(target, f0_ratio, fem_strength)
 
-        f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
+        f0_converted = _smooth_f0(f0 * f0_ratio)
         sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
         sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
         sp_converted = _mix_with_original(sp, sp_converted, target, fem_strength)
         sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
-        ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+        ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
         y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
         if y_converted.size:
