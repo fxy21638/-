@@ -344,7 +344,10 @@ class VoiceGenderWindow(QMainWindow):
         self._full_audio_chunks: list[np.ndarray] = []
         self._first_prediction_done = False
         self._amp_history: list[float] = []
-        self._spec_image = None
+        self._line_spec = None
+        self._line_conv_spec = None
+        self._preview_target: str | None = None  # "female" / "male" / None(关闭预览)
+        self._preview_tick = 0
 
         self._setup_ui()
         self._setup_charts()
@@ -426,6 +429,30 @@ class VoiceGenderWindow(QMainWindow):
         conv_btn_row.addWidget(self.to_female_btn)
         conv_btn_row.addWidget(self.to_male_btn)
         conv_layout.addLayout(conv_btn_row)
+
+        # 实时预览开关
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(8)
+        preview_label = QLabel("频谱预览:")
+        preview_label.setMinimumWidth(60)
+        preview_row.addWidget(preview_label)
+        self.preview_female_btn = QPushButton("预览女声")
+        self.preview_female_btn.setMinimumHeight(28)
+        self.preview_female_btn.setCheckable(True)
+        self.preview_female_btn.setStyleSheet("""
+            QPushButton { background-color: #d1d5db; color: #374151; border-radius: 6px; font-weight: bold; }
+            QPushButton:checked { background-color: #ec4899; color: #fff; }
+        """)
+        self.preview_male_btn = QPushButton("预览男声")
+        self.preview_male_btn.setMinimumHeight(28)
+        self.preview_male_btn.setCheckable(True)
+        self.preview_male_btn.setStyleSheet("""
+            QPushButton { background-color: #d1d5db; color: #374151; border-radius: 6px; font-weight: bold; }
+            QPushButton:checked { background-color: #3b82f6; color: #fff; }
+        """)
+        preview_row.addWidget(self.preview_female_btn)
+        preview_row.addWidget(self.preview_male_btn)
+        conv_layout.addLayout(preview_row)
         left_layout.addWidget(conv_group)
 
         # 文件上传
@@ -451,6 +478,10 @@ class VoiceGenderWindow(QMainWindow):
         self.confidence_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.confidence_label.setStyleSheet("font-size: 15px; color: #b91c1c;")
         result_layout.addWidget(self.confidence_label)
+        note = QLabel("※ 当前模型仅支持正常说话声，唱歌/假声/吼叫等可能误判")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note.setStyleSheet("font-size: 11px; color: #9ca3af; padding-top: 4px;")
+        result_layout.addWidget(note)
         left_layout.addWidget(result_group)
 
         # 调试信息
@@ -480,6 +511,8 @@ class VoiceGenderWindow(QMainWindow):
         self.strength_slider.valueChanged.connect(self._on_strength_changed)
         self.to_female_btn.clicked.connect(lambda: self._on_convert("female"))
         self.to_male_btn.clicked.connect(lambda: self._on_convert("male"))
+        self.preview_female_btn.clicked.connect(lambda checked: self._on_preview_toggle("female", checked))
+        self.preview_male_btn.clicked.connect(lambda checked: self._on_preview_toggle("male", checked))
         self.upload_btn.clicked.connect(self._on_upload)
 
     # ── 图表 ─────────────────────────────────────────────────────────
@@ -496,28 +529,30 @@ class VoiceGenderWindow(QMainWindow):
 
         self.ax_spec = self.canvas.figure.add_subplot(2, 1, 2)
         self.ax_spec.set_facecolor("#1a1a2e")
-        self.ax_spec.set_title("实时语谱图 (Spectrogram)", fontsize=12, fontweight="bold", color="#374151")
-        self.ax_spec.set_ylabel("频率 (Hz)", fontsize=10, color="#6b7280")
-        self.ax_spec.set_xlabel("时间 (s)", fontsize=10, color="#6b7280")
+        self.ax_spec.set_title("实时频谱 (Frequency Spectrum)", fontsize=12, fontweight="bold", color="#374151")
+        self.ax_spec.set_xlabel("频率 (Hz)", fontsize=10, color="#6b7280")
+        self.ax_spec.set_ylabel("幅度 (dB)", fontsize=10, color="#6b7280")
+        self.ax_spec.set_xlim(0, 4000)
+        self.ax_spec.set_ylim(-60, 0)
         self.ax_spec.tick_params(labelsize=9, colors="#6b7280")
+        self.ax_spec.grid(True, alpha=0.15, color="#ffffff")
 
         self._line_amp, = self.ax_amp.plot([], [], color="#4b5563", linewidth=1.8)
-        self._spec_image = self.ax_spec.imshow(
-            np.zeros((10, 10)), aspect="auto", origin="lower",
-            cmap="inferno", interpolation="bilinear",
-        )
-        cbar = self.canvas.figure.colorbar(self._spec_image, ax=self.ax_spec, label="dB")
-        self.canvas.figure.tight_layout(rect=[0, 0.08, 1, 1])
+        self._line_spec, = self.ax_spec.plot([], [], color="#f59e0b", linewidth=1.2, label="原始")
+        self._line_conv_spec, = self.ax_spec.plot([], [], color="#06b6d4", linewidth=1.2, label="转换后")
+        self.ax_spec.legend(loc="upper right", fontsize=8, labelcolor="#6b7280",
+                            facecolor="#1a1a2e", edgecolor="#374151", framealpha=0.8)
 
         guide = (
-            "读法: 横轴=时间  纵轴=频率(Hz)  亮色=能量强  |  "
-            "水平亮纹→谐波(Harmonics)  |  "
-            "深色宽带→共振峰(Formants)  |  "
-            "竖直条纹→辅音/爆破音"
+            "橙色=原始频谱  青色=转换后频谱  |  "
+            "横轴=频率(Hz)  纵轴=能量(dB)  峰值→共振峰/谐波  |  "
+            "男声: 基频低(~85-180Hz) 谐波间距窄 高频弱 共振峰低  |  "
+            "女声: 基频高(~165-255Hz) 谐波间距宽 高频强 共振峰高"
         )
         self.canvas.figure.text(0.5, 0.01, guide, ha="center", va="bottom",
-                                fontsize=8, color="#6b7280", style="italic",
+                                fontsize=7.5, color="#6b7280", style="italic",
                                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f5", edgecolor="#dde1e7", alpha=0.9))
+        self.canvas.figure.tight_layout(rect=[0, 0.08, 1, 1])
         self.canvas.draw_idle()
 
     def _update_amp_chart(self, amplitude: float):
@@ -532,20 +567,72 @@ class VoiceGenderWindow(QMainWindow):
         self.ax_amp.set_xlim(-0.5, self.MAX_CHART_POINTS - 1 + 0.5)
         self.canvas.draw_idle()
 
-    def _update_spectrogram(self, audio: np.ndarray):
-        n_fft = 1024
-        hop_length = 256
-        stft = np.abs(librosa.stft(audio.astype(np.float64), n_fft=n_fft, hop_length=hop_length))
-        spec_db = librosa.amplitude_to_db(stft, ref=np.max, top_db=60)
+    def _on_preview_toggle(self, target: str, checked: bool):
+        if checked:
+            self._preview_target = target
+            # 互斥: 关闭另一个按钮
+            if target == "female":
+                self.preview_male_btn.setChecked(False)
+                self.ax_spec.set_title("实时频谱 — 预览女声转换", fontsize=12, fontweight="bold", color="#ec4899")
+            else:
+                self.preview_female_btn.setChecked(False)
+                self.ax_spec.set_title("实时频谱 — 预览男声转换", fontsize=12, fontweight="bold", color="#3b82f6")
+        else:
+            self._preview_target = None
+            self._line_conv_spec.set_data([], [])
+            self.ax_spec.set_title("实时频谱 (Frequency Spectrum)", fontsize=12, fontweight="bold", color="#374151")
+            self.canvas.draw_idle()
 
-        freqs = librosa.fft_frequencies(sr=self.SAMPLE_RATE, n_fft=n_fft)
-        times = librosa.frames_to_time(np.arange(spec_db.shape[1]), sr=self.SAMPLE_RATE, hop_length=hop_length)
-        voice_mask = freqs <= 4000
-
-        self._spec_image.set_data(spec_db[voice_mask, :])
-        self._spec_image.set_extent([times[0], times[-1], 0, 4000])
-        self._spec_image.set_clim(vmin=-60, vmax=0)
+    def _update_spectrum(self, audio: np.ndarray):
+        n_fft = 2048
+        spec = np.abs(np.fft.rfft(audio.astype(np.float64), n=n_fft))
+        spec_db = librosa.amplitude_to_db(spec, ref=np.max, top_db=60)
+        freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
+        mask = freqs <= 4000
+        self._line_spec.set_data(freqs[mask], spec_db[mask])
         self.canvas.draw_idle()
+
+    def _preview_convert(self, audio: np.ndarray):
+        """实时预览转换: 对短音频块运行 WORLD 管线, 返回转换后的频谱"""
+        try:
+            y = audio.astype(np.float64)
+            sr = self.SAMPLE_RATE
+            target = self._preview_target
+            strength = self.strength_slider.value() / 100.0
+
+            f0, t = pw.harvest(y, sr, f0_floor=50.0, f0_ceil=500.0)
+            f0 = pw.stonemask(y, f0, t, sr)
+            sp = pw.cheaptrick(y, f0, t, sr)
+            ap = pw.d4c(y, f0, t, sr)
+
+            voiced_f0 = f0[f0 > 0]
+            mean_f0 = float(np.mean(voiced_f0)) if voiced_f0.size else 0.0
+            strength = _clamp_control(strength)
+            brightness = 0.35 + strength * 0.45
+            f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
+            formant_factor = _compute_formant_factor(target, f0_ratio, strength)
+
+            f0_converted = _smooth_f0(f0 * f0_ratio, window=5)
+            sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
+            sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
+            sp_converted = _mix_with_original(sp, sp_converted, target, strength)
+            sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
+            ap_converted = _adjust_aperiodicity(ap, f0_ratio, target)
+            y_conv = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
+
+            if y_conv.size:
+                peak = float(np.max(np.abs(y_conv)))
+                if peak > 1.0:
+                    y_conv = y_conv / peak
+
+            n_fft = 2048
+            spec_conv = np.abs(np.fft.rfft(y_conv.astype(np.float64), n=n_fft))
+            spec_conv_db = librosa.amplitude_to_db(spec_conv, ref=np.max, top_db=60)
+            freqs = np.fft.rfftfreq(n_fft, 1.0 / self.SAMPLE_RATE)
+            mask = freqs <= 4000
+            self._line_conv_spec.set_data(freqs[mask], spec_conv_db[mask])
+        except Exception:
+            self._line_conv_spec.set_data([], [])
 
     # ── 样式表 ───────────────────────────────────────────────────────
     def _setup_style(self):
@@ -776,6 +863,11 @@ class VoiceGenderWindow(QMainWindow):
         if self._ring:
             self._ring = None
 
+        self._preview_target = None
+        self.preview_female_btn.setChecked(False)
+        self.preview_male_btn.setChecked(False)
+        self.ax_spec.set_title("实时频谱 (Frequency Spectrum)", fontsize=12, fontweight="bold", color="#374151")
+
         self._update_button_states("stopped")
         dur = float(self._full_audio_for_export.size / self.SAMPLE_RATE) if self._full_audio_for_export is not None else 0
         self.rec_status.setText(f"已停止 — 录制 {dur:.1f}s")
@@ -798,9 +890,14 @@ class VoiceGenderWindow(QMainWindow):
 
         self._update_amp_chart(amplitude)
 
-        spec_audio = self._ring.get_last(2.5)
-        if spec_audio is not None and spec_audio.size >= 1024:
-            self._update_spectrogram(spec_audio)
+        spec_audio = self._ring.get_last(0.3)
+        if spec_audio is not None and spec_audio.size >= 256:
+            self._update_spectrum(spec_audio)
+            # 实时预览转换(每300ms运行一次, 避免阻塞)
+            if self._preview_target is not None:
+                self._preview_tick += 1
+                if self._preview_tick % 3 == 0:
+                    self._preview_convert(spec_audio)
 
     # ── 定时预测 ─────────────────────────────────────────────────────
     def _tick_predict(self):
@@ -960,7 +1057,8 @@ class VoiceGenderWindow(QMainWindow):
     # ── 图表清理 ─────────────────────────────────────────────────────
     def _clear_charts(self):
         self._line_amp.set_data([], [])
-        self._spec_image.set_data(np.zeros((10, 10)))
+        self._line_spec.set_data([], [])
+        self._line_conv_spec.set_data([], [])
         self.ax_amp.set_ylim(0, 0.01)
         self.canvas.draw_idle()
 

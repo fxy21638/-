@@ -58,9 +58,15 @@ from main import (
 1. `PredictWorker.run()` → `_ensure_min_duration()` → VAD 检测 → `_load_model()` → `extract_audio_features()` → XGBoost 推理
 
 **GUI 定时器架构（voice_gender_gui.py）：**
-- `_chart_timer` (100ms) → `_tick_chart()`: 从 `AudioRingBuffer` 取 0.3s 音频，FFT 算频谱质心，更新两个 matplotlib 图
+- `_chart_timer` (100ms) → `_tick_chart()`: 取 0.3s 音频，更新幅度走势图 + 实时频谱线图（np.fft.rfft），若开启预览则每 300ms 运行 WORLD 转换管线
 - `_predict_timer` (1500ms) → `_tick_predict()`: 取 3s 音频，启动 `PredictWorker` 线程，更新性别标签和调试信息
 - 图表受 `_first_prediction_done` 门控，等首次预测完成后才开始绘制
+- 实时频谱预览：橙色=原始频谱，青色=经 WORLD 转换后的频谱，用于调试变声参数
+
+**模型局限：**
+- 训练数据仅包含正常说话声（和鲸社区 voice-gender 数据集，3168条）
+- 唱歌、假声、吼叫等非正常说话可能导致误判（F0升高→被误判为女声）
+- meanfun（平均基频）占模型重要性 59.4%，是性别判定的主导特征
 
 ## 模型文件
 
