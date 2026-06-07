@@ -358,6 +358,10 @@ class VoiceGenderWindow(QMainWindow):
         self._preview_tick = 0
         self._noise_floor = -40.0  # EMA-tracked noise floor for stable baseline clamping
         self._noise_floor_conv = -40.0
+        self._unknown_streak = 0       # 连续 unknown 次数防抖
+        self._last_displayed_gender = "?"  # 上次显示的性别
+        self._gender_streak = 0        # 连续同性别次数，防止男女震荡
+        self._pending_gender = None    # 待确认的新性别
 
         self._setup_ui()
         self._setup_charts()
@@ -866,6 +870,10 @@ class VoiceGenderWindow(QMainWindow):
             self._full_audio_for_export = None
             self._full_audio_chunks = []
             self._first_prediction_done = False
+            self._unknown_streak = 0
+            self._last_displayed_gender = "?"
+            self._gender_streak = 0
+            self._pending_gender = None
 
             self._stream = sd.InputStream(
                 samplerate=self.SAMPLE_RATE,
@@ -972,11 +980,32 @@ class VoiceGenderWindow(QMainWindow):
         self._first_prediction_done = True
         gender = result.get("gender", "unknown")
         if gender == "unknown":
-            self.gender_label.setText("未检测到人声")
-            self.confidence_label.setText("置信度：--%")
+            self._unknown_streak += 1
+            self._gender_streak = 0
+            self._pending_gender = None
+            if self._unknown_streak >= 2:
+                if self._last_displayed_gender != "unknown":
+                    self.gender_label.setText("未检测到人声")
+                    self.confidence_label.setText("置信度：--%")
+                    self._last_displayed_gender = "unknown"
         else:
-            self.gender_label.setText(gender)
-            self.confidence_label.setText(f"置信度：{result['confidence']}%")
+            self._unknown_streak = 0
+            new_label = str(gender)
+            if self._last_displayed_gender == new_label:
+                self._gender_streak = 0
+                self._pending_gender = None
+            else:
+                if self._pending_gender == new_label:
+                    self._gender_streak += 1
+                else:
+                    self._pending_gender = new_label
+                    self._gender_streak = 1
+                if self._gender_streak >= 3:
+                    self.gender_label.setText(gender)
+                    self.confidence_label.setText(f"置信度：{result['confidence']}%")
+                    self._last_displayed_gender = new_label
+                    self._gender_streak = 0
+                    self._pending_gender = None
 
         # 调试信息
         dbg = result.get("debug", {})

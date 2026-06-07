@@ -4,9 +4,9 @@
 
 ## 功能
 
-- **实时声音性别识别**：麦克风采集音频，每 2 秒输出性别预测 + 置信度
+- **实时声音性别识别**：麦克风采集音频，每 1.5 秒输出性别预测 + 置信度
 - **声音转换**：将录音转换为男声或女声（pyworld F0 + 频谱包络处理）
-- **音频文件测试**：上传 WAV/MP3 文件进行离线识别，展示全部 20 个声学特征
+- **音频文件测试**：上传 WAV/MP3 文件进行离线识别，展示全部 18 个声学特征
 - **实时图表**：声音幅度和归一化频率趋势图
 - **两种界面**：Web 版（浏览器录音）和桌面版（sounddevice 采集，更稳定）
 
@@ -46,10 +46,10 @@ pip install fastapi uvicorn PySide6 librosa soundfile pyworld xgboost scikit-lea
 | 文件 | 说明 |
 | ---- | ---- |
 | `voice_xgb_model.pkl` | 训练好的 XGBoost 分类器 |
-| `voice_feature_names.pkl` | 20 个声学特征名称列表 |
+| `voice_feature_names.pkl` | 18 个声学特征名称列表 |
 | `voice_label_mapping.pkl` | 标签映射（0=女性, 1=男性） |
 
-> 模型基于 [和鲸社区 voice-gender 数据集](https://www.heywhale.com/mw/project/5fac97c88ca2cf0030cb200e) 训练。
+> 模型基于 [RAVDESS 数据集](https://zenodo.org/record/1188976) 训练（1320 条语音 + 4 种噪音增强），5 折 CV 准确率 91.1%。
 
 ### 运行桌面版（推荐）
 
@@ -88,7 +88,7 @@ python build_gui_exe.py
 | UI | PySide6 + matplotlib | HTML5 + Chart.js |
 | 音频采集 | sounddevice (PortAudio) | Web Audio API |
 | 特征提取 | librosa | librosa (后端) |
-| 分类模型 | XGBoost (21 特征) | 同左 |
+| 分类模型 | XGBoost (18 特征) | 同左 |
 | 声音转换 | pyworld (F0 + 频谱) | 同左 |
 
 ## License

@@ -1,4 +1,4 @@
-信号与系统课程大作业 — 声音男女识别项目 知识点分析
+声音男女识别项目 — 信号与系统知识点分析
 ============================================================
 
 本项目基于 XGBoost + pyworld 实现实时声音性别识别与变声，
@@ -55,7 +55,7 @@ main.py:195-196
   freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
 对加窗分帧后的信号逐帧计算 DFT，取模得到幅度谱。
 这是整个项目的核心变换：将 1D 时域信号 y(t) 映射为
-2D 时频谱 S(t, f)，所有 20 个声学特征均基于此变换。
+2D 时频谱 S(t, f)，所有 18 个声学特征均基于此变换。
 
 【FFT 共轭对称性】
 main.py:179  n_bins = n_fft // 2 + 1 = 1025
@@ -144,8 +144,8 @@ F0 的标准差与均值之比，衡量音高变化的相对幅度，
 main.py:200-214
   mode = argmax(mean_spectrum) → 最大能量频点
   dom_freq = argmax(stft, axis=0) → 逐帧主频
-  meandom, mindom, maxdom → 优势频率的统计量
-  dfrange = maxdom - mindom → 优势频率的动态范围
+  meandom, maxdom → 优势频率的统计量
+  dfrange = maxdom - meandom → 优势频率的动态范围
 
 
 五、基频估计（Fundamental Frequency / Pitch）
@@ -279,7 +279,7 @@ voice_clarify.html:374-410  _encodeWAV()
 
 【信号采集 → 特征提取 → 分类的完整流水线】
 声音采集(sounddevice 22kHz) → 环形缓冲区(15s) + 全量chunk列表
-→ 滑动窗口(3s) → STFT(librosa) → 20维频域特征
+→ 滑动窗口(3s) → STFT(librosa) → 18维频域特征
 → XGBoost分类 → 性别预测（每1.5秒）
 
 【双定时器实时图表架构】
@@ -299,18 +299,20 @@ voice_gender_gui.py:
 十、频域特征空间与分类
 ─────────────────────
 
-【全部 20 个特征来源于频域】
+【全部 18 个特征来源于频域】
 voice_clarify_train.py:13-14
-特征名称列表（按训练数据 CSV 列顺序）：
+特征名称列表（18个特征，按训练数据 CSV 列顺序）：
   meanfreq, sd, median, Q25, Q75, IQR, skew, kurt,
-  sp.ent, sfm, mode, centroid, meanfun, minfun, maxfun,
-  meandom, mindom, maxdom, dfrange, modindx
+  sp.ent, mode, centroid, meanfun, minfun, maxfun,
+  meandom, maxdom, dfrange, modindx
 每一个特征都是时域信号经过 FFT/STFT → 频域
 → 统计聚合的结果。没有任何特征直接从时域采样值计算。
+注：相比原始20特征，移除了 sfm（谱平坦度）和 mindom（最小主频），
+两者在特征重要性分析中贡献极低且有噪声敏感性。
 
 【XGBoost 分类器】
 voice_clarify_train.py:16-42
-在 20 维频域特征空间中学习男/女非线性决策边界。
+在 18 维频域特征空间中学习男/女非线性决策边界。
 模型从训练数据中自动发现性别区分度高的特征组合
 （如 meanfun + IQR + sp.ent 组合）。
 
@@ -335,7 +337,7 @@ voice_clarify_train.py:16-42
 └─────────────────────────────┴──────────────────────────────────┘
 
 三个最突出的亮点：
-1. STFT + 20个频域特征的完整提取链：采样 → 加窗 → DFT → 统计特征
+1. STFT + 18个频域特征的完整提取链：采样 → 加窗 → DFT → 统计特征
 2. WORLD声码器的分析-修改-合成闭环：F0+频谱包络+非周期性 → 参数修改 → 重建
 3. 双定时器多速率实时处理：22kHz采集 → 100ms图表(10fps) → 1.5s模型预测，三层时间尺度
 
@@ -351,5 +353,6 @@ CLAUDE.md              — 项目架构文档：命令、调用链、约定
 README.md              — 使用说明与功能概述
 
 训练数据来源：
-和鲸社区 voice-gender 数据集
-https://www.heywhale.com/mw/project/5fac97c88ca2cf0030cb200e
+RAVDESS (Ryerson Audio-Visual Database of Emotional Speech and Song)
+1320条语音（660男+660女），含4种噪音增强（干净/低噪/中噪/50Hz电噪）
+重训后模型：XGBoost (max_depth=5, n_estimators=200), 5折CV准确率 91.1%，全量数据准确率 95.5%

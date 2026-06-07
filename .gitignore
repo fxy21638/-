@@ -16,3 +16,13 @@ recordings/
 
 # IDE
 .idea/
+
+# Generated report figures
+report_figures/
+
+# Generated reports and temp files
+train_output.log
+*.pkl
+
+# Model files (external)
+model/
