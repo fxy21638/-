@@ -24,5 +24,8 @@ report_figures/
 train_output.log
 *.pkl
 
+# Debug scripts
+debug_scripts/
+
 # Model files (external)
 model/
