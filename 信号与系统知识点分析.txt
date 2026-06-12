@@ -1,4 +1,4 @@
-声音男女识别项目 — 信号与系统知识点分析
+声音男女识别与变声项目 — 信号与系统知识点分析
 ============================================================
 
 本项目基于 XGBoost + pyworld 实现实时声音性别识别与变声，
@@ -9,7 +9,7 @@
 ─────────────────────
 
 【采样率 22050Hz】
-voice_gender_gui.py:308  SAMPLE_RATE = 22050
+voice_gender_gui.py  SAMPLE_RATE = 22050
 语音信号的典型带宽约 8-11kHz，根据 Nyquist 采样定理，采样率需大于 2×fmax。
 22050Hz > 2×11025Hz，满足无失真重建条件。
 
@@ -25,7 +25,7 @@ main.py:177-187
 使特征值与具体采样率无关，便于模型泛化。
 
 【实时块处理 — 离散时间窗化】
-voice_gender_gui.py:549-555
+voice_gender_gui.py
   sd.InputStream(samplerate=22050, blocksize=2048, callback=_audio_callback)
 每 2048 个采样点为一个处理块，持续时间 = 2048/22050 ≈ 93ms。
 这是离散时间信号处理中"分帧"概念的实时实现。
@@ -38,7 +38,7 @@ voice_gender_gui.py:114-163  class AudioRingBuffer
 【滑动窗口提取 — 预测窗口】
 voice_gender_gui.py:139-150  get_last(duration_seconds=3.0)
 从环形缓冲区取最近 3 秒数据用于预测，窗口以实时采集速率向前滑动。
-预测每 1.5 秒触发一次（PREDICT_INTERVAL_MS = 1500）。
+预测每 0.8 秒触发一次（PREDICT_INTERVAL_MS = 800）。
 
 【全量录音存储 — 突破环形缓冲限制】
 voice_gender_gui.py _audio_callback()
@@ -79,30 +79,27 @@ main.py:143-151  _spectral_entropy()
 白噪声 → 功率均匀分布 → 高熵；纯音 → 功率集中 → 低熵。
 用 log₂(n_bins) 做最大熵归一化（main.py:198）。
 
-【谱平坦度 — Wiener 熵】
+【谱平坦度 — Wiener 熵】（已从特征集移除）
 main.py:192  librosa.feature.spectral_flatness(y=y)
-               (∏|S(f)|)^(1/N)
-  flatness = ─────────────────
-                (1/N)Σ|S(f)|
-
-几何平均与算术平均之比，衡量信号的"调性 vs 噪声性"。
+在特征重要性分析中贡献极低且对噪声敏感，已从模型 18 特征中移除。
 
 
 三、信号能量与功率
 ─────────────────
 
 【RMS 能量 — 时域信号功率】
-main.py:482-487  _detect_voice_activity()
+main.py VAD 检测
   rms = sqrt(mean(y²))
-信号均方根 = 零均值信号的功率平方根。阈值 0.005 区分人声与静音。
+信号均方根 = 零均值信号的功率平方根。
 
 GUI 端 VAD (voice_gender_gui.py PredictWorker.run):
-  将音频按 100ms 分帧，统计 RMS > 0.005 的帧占比（active_ratio），
-  若 < 10% 则判定为无效语音。分帧统计比单次总体 RMS 更能容忍
-  句间停顿，减少"说着话却被判定为静音"的误判。
+  将音频按 100ms 分帧，以第 20 百分位为噪声基底，
+  阈值 = max(noise_floor × 3, 0.0015)。
+  若 RMS 超阈值帧占比 < 10% 则判定为无效语音。
+  自适应阈值设计：基于噪声基底的动态阈值，适应不同环境底噪。
 
 【峰值幅度检测】
-voice_gender_gui.py:506
+voice_gender_gui.py
   amplitude = max(|recent_y|)
 取最近 1 秒采样的绝对最大值，反映瞬时信号强度。
 
@@ -145,31 +142,35 @@ main.py:200-214
   mode = argmax(mean_spectrum) → 最大能量频点
   dom_freq = argmax(stft, axis=0) → 逐帧主频
   meandom, maxdom → 优势频率的统计量
-  dfrange = maxdom - meandom → 优势频率的动态范围
+  dfrange = maxdom - mindom → 优势频率的动态范围
 
 
 五、基频估计（Fundamental Frequency / Pitch）
 ───────────────────────────────────────────
 
 【YIN 算法 — 自相关法】
-main.py:217-220
+main.py:217-222
   f0 = librosa.yin(y, fmin=50, fmax=500, sr=sr)
+  f0 = f0[(f0 >= 50) & (f0 <= 450)]  # 清音帧伪迹剔除
 基于自相关函数的时域周期检测。搜索范围 50-500Hz
 覆盖人类语音 F0 范围：男声 ~85-180Hz，女声 ~165-255Hz。
+YIN 对所有帧输出估计值（包括清音帧），>450Hz 的值基本是伪迹，
+施加硬性剪裁确保特征提取的清洁度。
 
 【Harvest 算法 — 频域法】
-main.py:555 / voice_gender_gui.py:271
+main.py / voice_gender_gui.py (变声管线)
   f0, t = pw.harvest(y, sr, f0_floor=50, f0_ceil=500)
 pyworld 的更鲁棒基频估计器，结合多分辨率分析。
 配合 StoneMask 去除清音帧的 F0 假值：
-  f0 = pw.stonemask(y, f0, t, sr)  (main.py:556)
+  f0 = pw.stonemask(y, f0, t, sr)
 
 【F0 特征提取】
 main.py:224-227
   meanfun = mean(F0) / 1000  → 平均基频（归一化）
   minfun  = min(F0) / 1000   → 最低基频
   maxfun  = max(F0) / 1000   → 最高基频
-这三个特征是性别识别的核心特征之一。
+这三个特征是性别识别的核心特征之一，归一化除以 1000 确保
+与训练数据分布（meanfun ~0.06-0.24）对齐。
 
 
 六、源-滤波器模型（Source-Filter Model）— 变声核心
@@ -178,59 +179,90 @@ main.py:224-227
 语音 = 声门激励（源）× 声道共振（滤波器）是语音信号处理的经典理论。
 
 【F0 提取（源激励）】
-voice_gender_gui.py:271-272
+voice_gender_gui.py ConvertWorker.run()
   f0, t = pw.harvest(y, sr, f0_floor=50, f0_ceil=500)
   f0 = pw.stonemask(y, f0, t, sr)
 Harvest 算法提取基频轮廓 + StoneMask 去除清音帧误检。
 
 【频谱包络估计（声道滤波器）】
-voice_gender_gui.py:273
+voice_gender_gui.py ConvertWorker.run()
   sp = pw.cheaptrick(y, f0, t, sr)
 CheapTrick 算法估计频谱包络，代表声道的共振特性（共振峰）。
 
 【非周期性估计（谐波/噪声分离）】
-voice_gender_gui.py:274
+voice_gender_gui.py ConvertWorker.run()
   ap = pw.d4c(y, f0, t, sr)
 D4C 算法估计各频段的非周期成分比例（噪声/总能量）。
 
 【F0 比例缩放 — 改变音高】
-voice_gender_gui.py:297-298
+main.py:376-396  _compute_f0_ratio()
   f0_converted = _smooth_f0(f0 × f0_ratio, window=5)
 F0 缩放后经两阶段平滑处理（中值滤波 + 局部线性插值），消除估计野值。
-f0_ratio 由 _compute_f0_ratio() 根据目标性别、当前基频和强度参数综合计算，
-男声/女声方向均支持 strength 调节（0~1 控制转换力度）。
+参数公式（最新）：
+  男→女: target_f0 = 200 + 60×strength Hz, max_ratio = 1.80 + 0.80×strength
+  女→男: target_f0 = 120 - 55×strength Hz, min_ratio = 0.65 - 0.40×strength
+默认强度 0.55 时男→女比上限 2.24（100Hz 男声 → 224Hz 女声范围）。
 
-【共振峰频移（Formant Warping）】
-main.py:344-353  _warp_spectral_envelope()
-对频谱包络的频率轴做拉伸/压缩：
-  src_freqs = freqs / factor
-  warped = interp(freqs, src_freqs, sp)
-频率轴缩放改变了共振峰位置，从而改变音色（元音品质）。
+【共振峰移位（Formant Shift）— 局部频域拉伸】
+main.py:420-509  _estimate_formant_peaks() + _shift_formant_envelope()
 
-【频谱倾斜（Spectral Tilt）】
-main.py:356-368  _apply_spectral_tilt()
-对频谱包络施加频率相关增益（高频增强 → 女声明亮；高频衰减 → 男声低沉）:
-  sp = sp × tilt(freq)
-本质是一个频率域的线性滤波器。男声/女声方向均受 brightness 参数控制，
+创新点：不同于传统全局频率轴 warping，本项目采用基于共振峰检测的局部拉伸：
+1. _estimate_formant_peaks():
+   - log 域频谱用 scipy.signal.argrelextrema 检测峰值
+   - 共振峰频段约束：F1(200-900Hz), F2(800-2400Hz), F3(2000-3500Hz), F4(3000-4800Hz)
+   - 取每个频段内最高峰值作为该共振峰估计
+2. _shift_formant_envelope():
+   - 对每个共振峰的 ±30% 频宽区域做局部频域拉伸（np.interp 重采样）
+   - 混合比: 0.50 + 0.25×strength（50-75% 拉伸谱 + 25-50% 原始谱）
+   - 男→女移位 18-33%，女→男移位 10-20%
+   - 若 <10% 帧检出共振峰，回退到全局 warping
+
+设计原理：仅修改共振峰区域（声道滤波器的关键特征），保留其余频段的自然结构。
+相比全局 warping，避免了拉伸非共振峰区域的噪声和伪影。
+也避免了全局 warp 导致的主导频率（meandom）和频谱质心（centroid）超出训练分布。
+
+【频谱倾斜（Spectral Tilt）— 多段非线性频率域滤波】
+main.py:536-569  _apply_spectral_tilt()
+男→女方向（最新参数）:
+  50Hz:  0.50 - 0.22×brightness  → 深削最低频 (-50~-65%)
+  220Hz: 0.60 - 0.18×brightness  → 强削低音
+  550Hz: 0.92 + 0.06×brightness  → 近中性
+  1500Hz: 0.98 + 0.08×brightness → 微调（避免推高meandom）
+  3200Hz: 0.95 + 0.10×brightness → 微调（避免推高centroid）
+  11025Hz: 0.97 + 0.06×brightness → 接近平坦
+
+关键设计考量：1500Hz 和 3200Hz 的增益必须保守。过度增强中高频会
+提升频谱质心和主导频率，使其超出训练数据分布范围（centroid>0.251），
+导致模型将变声结果误判为男声。经过实验对比优化，当前参数在
+"音色可感知变化"与"特征保持在训练分布内"之间取得平衡。
+
+女→男方向:
+  大幅增强 50-250Hz 低频（+35~+54%）+ 大幅削减 1.5kHz 以上高频（-20~-42%）
 brightness = 0.35 + strength × 0.45，确保倾斜力度与用户设定强度一致。
 
 【频谱混合 — 频率自适应频域插值】
-main.py:369-379  _mix_with_original()
-  mix_ratio = linspace(0.20, 0.65, n_bins) + strength × 0.25 + 性别偏移
+main.py:572-586  _mix_with_original()
+  mix_base = linspace(0.85, 0.91, n_bins)  # 展平的频段混合
+  mix_ratio = mix_base + 0.06×strength + 性别偏移
   sp_out = (1 - mix_ratio) × sp_original + mix_ratio × sp_converted
-频率自适应的线性混合：低频偏保守（保留原声共振峰），高频偏激进（应用转换）。
-加法式缩放（非乘法）保持 mix_ratio 在 [0.18, 0.85] 内的频率差异化，
-避免 clip 吞噬设计意图。批量广播计算替代逐帧循环。
+混合比 85-91% 转换谱 + 9-15% 原始谱（默认强度下）。
+展平的 linspace 使各频段混合一致，避免旧版"低频保守/高频激进"的频段差异。
+男→女方向额外 +0.02，女→男方向额外 -0.01。
 
 【非周期性调整 — 谐波/噪声比控制】
-main.py:459-476  _adjust_aperiodicity(ap, f0_ratio, target)
-根据音高变化幅度(f0_ratio 偏离 1.0 的程度)动态调整高频非周期性。
+main.py:695-720  _adjust_aperiodicity(ap, f0_ratio, target)
+根据音高变化幅度（f0_ratio 偏离 1.0 的程度）动态调整高频非周期性。
 女声方向增加高频气息感（声门激励更不规则），男声方向减少。
-调整量与转换强度成比例（最大 ±10%），clip 到 [0, 1]。
+调整量与转换强度成比例，仅在 F0>0 的浊音帧上执行。
+
+【后处理低通滤波】
+main.py:670-678  _post_process()
+7.5kHz Butterworth 低通滤波（4阶），去除 WORLD 合成可能引入的高频伪影。
+截止频率选择：保留语音主要频段（<7.5kHz），滤除合成算法可能产生的高频杂散。
 
 【WORLD 合成 — 从参数重建波形】
-voice_gender_gui.py:288
-  y_converted = pw.synthesize(f0_converted, sp_converted, ap, sr)
+voice_gender_gui.py ConvertWorker.run()
+  y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 从 F0（源）+ 频谱包络（滤波器）+ 非周期性（噪声配比）
 三个参数重建时域波形。这是分析-修改-合成的完整闭环。
 
@@ -238,22 +270,25 @@ voice_gender_gui.py:288
 七、滤波与卷积
 ─────────────
 
-【频谱包络平滑 — 两步同态+LTI滤波】
-main.py:429-456  _smooth_spectral_envelope()
-第一步（频率维度）：log 域五点滑动平均 FIR 低通
-  smoothed[idx] = np.convolve(log_sp[idx], [1/5]*5, mode='same')
-第二步（时间维度）：三帧加权平均
-  smoothed_time[t] = 0.25×sp[t-1] + 0.5×sp[t] + 0.25×sp[t+1]
-同态滤波（log → 卷积 → exp）消除频谱快起伏，保留宽共振峰；
-时间维平滑抑制相邻帧间的剧烈跳变。频率+时间双向 LTI 滤波。
-
-【F0 平滑 — 中值+线性两阶段非线性处理】
-main.py:397-426  _smooth_f0(window=5)
-第一阶段（中值滤波）：smoothed[idx] = median(邻域内有声F0)
-  去除非线性野值（倍频/半频错误），保留清/浊音边缘。
+【F0 平滑 — 中值+线性两阶段处理】
+main.py:589-614  _smooth_f0(window=5)
+第一阶段（中值滤波）：对邻域内有声帧取中值
+  去除孤立野值（倍频/半频错误），保留清/浊音边界。
 第二阶段（局部线性插值）：有声段间隙 ≤ 6 帧（~30ms）的短断裂
   用线性插值桥接，修复 F0 估计的临时断裂。
 非线性（中值）+ 线性（插值）的组合处理。
+
+【频谱包络平滑 — 同态滤波】
+main.py:680-692  _smooth_spectral_envelope()
+log 域滑动平均 FIR 低通滤波 → exp 重建。
+取 log → 卷积 → exp 的过程称为同态滤波。
+注：经实验验证，此平滑会降低频谱熵（sp.ent），
+对男→女变声有反作用，GUI 管线中已移除。仅保留在 Web 版变声管线中。
+
+【后处理 Butterworth 低通】
+main.py _post_process()
+7.5kHz 截止频率，4 阶 Butterworth IIR 滤波器，
+经 filtfilt 零相位滤波（正反两次，消除相位失真）。
 
 
 八、信号重构与预处理
@@ -264,6 +299,12 @@ main.py:154-163  _ensure_min_duration()
   y = pad(y, (pad_left, pad_right), mode='edge')
 对不足 1.2 秒的音频做对称边缘填充（重复边界值）。
 相比零填充，edge 模式不会在边界引入人为的频谱跳变。
+
+【静音裁剪】
+main.py  _trim_silence()
+librosa.effects.trim(top_db=28) 裁掉首尾静音。
+仅用于变声流程（避免无声段 WORLD 合成产生杂音），
+预测流程中不使用（裁切后 _ensure_min_duration 填充会产生畸形特征）。
 
 【WAV 编码 — 采样量化的直接体现】
 voice_clarify.html:374-410  _encodeWAV()
@@ -280,28 +321,34 @@ voice_clarify.html:374-410  _encodeWAV()
 【信号采集 → 特征提取 → 分类的完整流水线】
 声音采集(sounddevice 22kHz) → 环形缓冲区(15s) + 全量chunk列表
 → 滑动窗口(3s) → STFT(librosa) → 18维频域特征
-→ XGBoost分类 → 性别预测（每1.5秒）
+→ XGBoost分类 → 性别预测（每0.8秒）
 
 【双定时器实时图表架构】
 voice_gender_gui.py:
   高速图表定时器(_chart_timer, 100ms):
-    从缓冲区取 0.3s 音频 → 峰值幅度 + FFT频谱质心 → 更新双图
-  预测定时器(_predict_timer, 1500ms):
-    取 3s 音频 → PredictWorker线程 → 性别标签 + 调试信息
-  图表受 _first_prediction_done 门控，等首次模型预测完成后才启动，
-  确保图表与预测结论同步呈现。
-  双定时器的多速率设计：音频 22kHz → 图表 10Hz → 预测 ~0.67Hz。
-上子图：声音幅度趋势（80点, 8秒窗口, 10fps）
-下子图：归一化频率趋势（80点, 8秒窗口, 10fps, FFT实时估算）
+    从缓冲区取 0.4s 音频 → 峰值幅度 + 8192点FFT频谱 → 更新双图
+    若开启预览，每 300ms 运行 WORLD 转换管线（实时对比原始/转换频谱）
+  预测定时器(_predict_timer, 800ms):
+    取 3s 音频 → PredictWorker线程 → 性别标签 + 男女声占比
+  双定时器的多速率设计：音频 22kHz → 图表 10Hz → 预测 ~1.25Hz。
+上子图：声音幅度趋势（800点, 80秒窗口）
+下子图：实时频谱线图（8192点FFT, 50-5000Hz对数轴, -40~0dB）
 时域和频域的双视角实时可视化。
+
+【实时频谱预览】
+voice_gender_gui.py: _update_spectrum()
+- 橙色 = 原始频谱（8192点FFT + Hann窗）
+- 青色 = 经 WORLD 转换后的频谱（实时调试变声参数）
+- EMA 噪声门限（α=0.15）：平滑噪声基底，压平为稳定水平线
+- fill_between 填充显示，5点移动平均平滑保留谐波峰结构
 
 
 十、频域特征空间与分类
 ─────────────────────
 
 【全部 18 个特征来源于频域】
-voice_clarify_train.py:13-14
-特征名称列表（18个特征，按训练数据 CSV 列顺序）：
+voice_clarify_train_v2.py:19-27
+特征名称列表（18个特征）：
   meanfreq, sd, median, Q25, Q75, IQR, skew, kurt,
   sp.ent, mode, centroid, meanfun, minfun, maxfun,
   meandom, maxdom, dfrange, modindx
@@ -311,10 +358,33 @@ voice_clarify_train.py:13-14
 两者在特征重要性分析中贡献极低且有噪声敏感性。
 
 【XGBoost 分类器】
-voice_clarify_train.py:16-42
+voice_clarify_train_v2.py:77-83
 在 18 维频域特征空间中学习男/女非线性决策边界。
-模型从训练数据中自动发现性别区分度高的特征组合
-（如 meanfun + IQR + sp.ent 组合）。
+模型参数: max_depth=3, n_estimators=100, learning_rate=0.1
+特征重要性: meanfun(10.2%), maxfun(8.2%), modindx(7.3%) → Top3 合计 25.7%
+
+【训练策略 — 演员独立划分】
+voice_clarify_train_v2.py
+不再使用随机 80/20 按文件划分（会导致同一演员的语音出现在训练/测试集，
+造成数据泄漏），而是按 RAVDESS 的 Actor ID 划分：
+  训练集: Actor 1-22（男女各 11 位）→ 1320 条音频
+  测试集: Actor 23(男) + Actor 24(女) → 264 条音频
+  模型性能: 测试集 79.2%（男 61.7%, 女 96.7%），全量 95.5%
+这种划分方式是语音识别研究的标准做法，确保测试集演员从未被模型见过。
+
+【分段预测 — 长音频男女声占比】
+main.py:239-286  predict_gender_segmented()
+混合策略：
+  全局预测: 完整音频提取特征 → 性别判断（匹配训练流程）
+  分段投票: 2.5s 窗口 + 0.8s 步长滑动 → 各段独立预测 → 统计占比
+  置信度 <55% 的段标记为 unknown
+应用在文件上传测试中显示男女声百分比，实时麦克风不显示（始终同一说话人）。
+
+【F0 特征提取改进】
+main.py:218-222
+librosa.yin 对所有帧（包括清音帧）输出 F0 估计，
+清音/噪音帧的虚假 F0 值（>450Hz）是误判重要来源。
+施加 f0[(f0>=50) & (f0<=450)] 硬性剪裁，确保 maxfun 不受伪迹污染。
 
 
 ═══════════════════════════════════════════════
@@ -327,32 +397,48 @@ voice_clarify_train.py:16-42
 │ 连续/离散时间信号           │ 音频采样(22050Hz)、块处理        │
 │ 采样定理 (Nyquist)          │ 频率归一化、WAV编码              │
 │ 傅里叶级数 / 傅里叶变换     │ STFT、频谱质心                   │
-│ 滤波 (卷积)                 │ FIR平滑、中值滤波                │
-│ 频率响应                    │ 频谱倾斜、共振峰频移             │
-│ 信号能量与功率              │ RMS、VAD、峰值检测               │
-│ 随机信号                    │ 谱熵、谱平坦度                   │
-│ 统计信号处理                │ 偏度、峰度、分位数               │
+│ 滤波 (卷积)                 │ F0中值平滑、Butterworth低通      │
+│ 频率响应                    │ 频谱倾斜、共振峰局部频移         │
+│ 信号能量与功率              │ RMS、VAD自适应阈值、峰值检测     │
+│ 随机信号                    │ 谱熵                             │
+│ 统计信号处理                │ 偏度、峰度、分位数、调制指数     │
 │ 源-滤波器模型               │ WORLD合成管线(F0+频谱+非周期性)  │
 │ 信号重构                    │ 边缘填充、声码器合成             │
 └─────────────────────────────┴──────────────────────────────────┘
 
-三个最突出的亮点：
+四个最突出的亮点：
 1. STFT + 18个频域特征的完整提取链：采样 → 加窗 → DFT → 统计特征
 2. WORLD声码器的分析-修改-合成闭环：F0+频谱包络+非周期性 → 参数修改 → 重建
-3. 双定时器多速率实时处理：22kHz采集 → 100ms图表(10fps) → 1.5s模型预测，三层时间尺度
+3. 基于共振峰检测的局部频域拉伸：F1-F4检测 + 局部warping，比全局频率轴拉伸
+   更精准地模拟声道共振特性变化，是源-滤波器模型理论的直接工程实现
+4. 三速率多任务实时处理：22kHz采集 → 100ms图表(10fps) + 300ms频谱预览
+   → 0.8s模型预测 + 1.5s分段投票，四层时间尺度协同工作
 
 ═══════════════════════════════════════════════
 关键代码文件
 ═══════════════════════════════════════════════
 
-main.py               — FastAPI后端：特征提取函数、VAD、WORLD变声管线
-voice_gender_gui.py   — PySide6桌面GUI：实时采集、环形缓冲、双定时器图表
-voice_clarify_train.py — 模型训练：XGBoost在频域特征空间中的分类
-voice_clarify_mode.py  — 模型持久化：训练+导出三个.pkl文件
-CLAUDE.md              — 项目架构文档：命令、调用链、约定
-README.md              — 使用说明与功能概述
+main.py                     — FastAPI后端 + 算法层：特征提取、VAD、WORLD变声管线
+voice_gender_gui.py         — PySide6桌面GUI：实时采集、环形缓冲、双定时器图表、
+                              文件上传、声音转换、实时频谱预览
+voice_clarify_train.py      — 模型训练（旧版 — 随机划分）
+voice_clarify_train_v2.py   — 模型训练（新版 — 演员独立划分 Actor 1-22/23-24）
+voice_clarify_mode.py       — 模型持久化：训练+导出三个.pkl文件
+gen_report_figures.py       — 项目报告图表生成
+build_gui_exe.py            — 桌面版 PyInstaller 打包脚本
+debug_scripts/              — 诊断/调试脚本（diagnose_conversion, test_conversion_both 等）
+CLAUDE.md                   — 项目架构与开发文档
+README.md                   — 使用说明与功能概述
 
-训练数据来源：
+训练数据：
 RAVDESS (Ryerson Audio-Visual Database of Emotional Speech and Song)
-1320条语音（660男+660女），含4种噪音增强（干净/低噪/中噪/50Hz电噪）
-重训后模型：XGBoost (max_depth=5, n_estimators=200), 5折CV准确率 91.1%，全量数据准确率 95.5%
+1320条语音（660男+660女），演员独立划分（Actor 1-22训练，23-24测试）
+模型：XGBoost (max_depth=3, n_estimators=100, learning_rate=0.1)
+测试集准确率: 79.2%（男 61.7%, 女 96.7%），全量准确率: 95.5%
+
+变声性能：
+女→男: ~100% 成功率（F0降低 + 削高频 + 增强低频）
+男→女: ~50-60% 成功率（需大幅提升F0 + 共振峰移位，极端频谱特征难以完全消除）
+男→女变声的根本限制：当原始音频的频谱熵（sp.ent）远低于训练范围
+（<0.5 vs 训练最低 0.739），信号处理无法将特征恢复到训练分布内。
+这是训练数据多样性的限制，非代码缺陷。
