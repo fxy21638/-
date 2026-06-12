@@ -96,15 +96,14 @@ from main import (
     extract_audio_features,
     _ensure_min_duration,
     _smooth_f0,
-    _smooth_spectral_envelope,
     _warp_spectral_envelope,
     _apply_spectral_tilt,
     _mix_with_original,
     _clamp_control,
     _compute_f0_ratio,
-    _compute_formant_factor,
     _adjust_aperiodicity,
     _trim_silence,
+    _post_process,
 )
 
 
@@ -299,13 +298,15 @@ class ConvertWorker(QThread):
             strength = _clamp_control(strength)
             brightness = 0.35 + strength * 0.45
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
-            formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
             f0_converted = _smooth_f0(f0 * f0_ratio)
+            if target == "female":
+                formant_factor = 1.06 + 0.10 * strength
+            else:
+                formant_factor = 0.96 - 0.08 * strength
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
-            sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
             ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
             y_converted = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
@@ -313,6 +314,8 @@ class ConvertWorker(QThread):
                 peak = float(np.max(np.abs(y_converted)))
                 if peak > 1.0:
                     y_converted = y_converted / peak
+
+            y_converted = _post_process(y_converted, sr)
 
             sf.write(self._output_path, y_converted.astype(np.float32), sr)
             self.finished.emit(self._output_path)
@@ -326,7 +329,7 @@ class ConvertWorker(QThread):
 class VoiceGenderWindow(QMainWindow):
     MAX_CHART_POINTS = 800
     CHART_INTERVAL_MS = 100
-    PREDICT_INTERVAL_MS = 1500
+    PREDICT_INTERVAL_MS = 800
     WINDOW_SECONDS = 3.0
     SAMPLE_RATE = 22050
 
@@ -428,7 +431,7 @@ class VoiceGenderWindow(QMainWindow):
         strength_row.addWidget(strength_label)
         self.strength_slider = QSlider(Qt.Orientation.Horizontal)
         self.strength_slider.setRange(0, 100)
-        self.strength_slider.setValue(55)
+        self.strength_slider.setValue(70)
         strength_row.addWidget(self.strength_slider)
         self.strength_value_label = QLabel("55%")
         self.strength_value_label.setMinimumWidth(36)
@@ -643,13 +646,15 @@ class VoiceGenderWindow(QMainWindow):
             strength = _clamp_control(strength)
             brightness = 0.35 + strength * 0.45
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
-            formant_factor = _compute_formant_factor(target, f0_ratio, strength)
 
             f0_converted = _smooth_f0(f0 * f0_ratio)
+            if target == "female":
+                formant_factor = 1.06 + 0.10 * strength
+            else:
+                formant_factor = 0.96 - 0.08 * strength
             sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
-            sp_converted = _smooth_spectral_envelope(sp_converted, window=3)
             ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
             y_conv = pw.synthesize(f0_converted, sp_converted, ap_converted, sr)
 
@@ -657,6 +662,8 @@ class VoiceGenderWindow(QMainWindow):
                 peak = float(np.max(np.abs(y_conv)))
                 if peak > 1.0:
                     y_conv = y_conv / peak
+
+            y_conv = _post_process(y_conv, self.SAMPLE_RATE)
 
             n_fft = 4096
             conv_audio = y_conv.astype(np.float64)
@@ -983,7 +990,7 @@ class VoiceGenderWindow(QMainWindow):
             self._unknown_streak += 1
             self._gender_streak = 0
             self._pending_gender = None
-            if self._unknown_streak >= 2:
+            if self._unknown_streak >= 1:
                 if self._last_displayed_gender != "unknown":
                     self.gender_label.setText("未检测到人声")
                     self.confidence_label.setText("置信度：--%")
@@ -994,13 +1001,14 @@ class VoiceGenderWindow(QMainWindow):
             if self._last_displayed_gender == new_label:
                 self._gender_streak = 0
                 self._pending_gender = None
+                self.confidence_label.setText(f"置信度：{result['confidence']}%")
             else:
                 if self._pending_gender == new_label:
                     self._gender_streak += 1
                 else:
                     self._pending_gender = new_label
                     self._gender_streak = 1
-                if self._gender_streak >= 3:
+                if self._gender_streak >= 2:
                     self.gender_label.setText(gender)
                     self.confidence_label.setText(f"置信度：{result['confidence']}%")
                     self._last_displayed_gender = new_label

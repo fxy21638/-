@@ -76,43 +76,74 @@ def fig1_spectrograms():
     print("[OK] 图1: 语谱图对比")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 图2: F0 (基频) 轮廓对比
+# 图2: F0 (基频) 轮廓对比 — 上下分栏，浊音点 + 插值线
 # ═══════════════════════════════════════════════════════════════════════════
 def fig2_f0_contour():
-    male_fp = sorted((DATA / "male").glob("*.wav"))[50]
-    female_fp = sorted((DATA / "female").glob("*.wav"))[50]
+    # 选F0差异明显的典型样本: 男~99Hz, 女~258Hz
+    male_fp = sorted((DATA / "male").glob("*.wav"))[150]
+    female_fp = sorted((DATA / "female").glob("*.wav"))[20]
 
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                                    gridspec_kw={"hspace": 0.18})
 
-    for fp, label, color in [(male_fp, "男性 (Male)", "#3b82f6"),
-                               (female_fp, "女性 (Female)", "#ec4899")]:
+    configs = [
+        (ax1, male_fp, "男性 (Male)", "#2563eb", (60, 200), "男声典型范围\n~85–180 Hz"),
+        (ax2, female_fp, "女性 (Female)", "#db2777", (140, 400), "女声典型范围\n~165–255 Hz"),
+    ]
+
+    for ax, fp, label, color, band, band_label in configs:
         y, sr_orig = sf.read(str(fp), dtype="float32")
         if y.ndim > 1: y = np.mean(y, axis=1)
         if sr_orig != SR: y = librosa.resample(y, orig_sr=sr_orig, target_sr=SR)
 
-        f0, voiced_flag, _ = librosa.pyin(y, fmin=50, fmax=500, sr=SR)
+        f0, voiced_flag, _ = librosa.pyin(y, fmin=50, fmax=500, sr=SR, fill_na=None)
         times = librosa.times_like(f0, sr=SR)
 
-        # 插值填平清音/无声段的 NaN 断层
+        # 分离浊音/清音
         valid = ~np.isnan(f0)
-        if valid.sum() > 0:
-            f0_interp = np.interp(times, times[valid], f0[valid])
-        else:
-            f0_interp = f0
+        voiced_t = times[valid]
+        voiced_f = f0[valid]
+        unvoiced_t = times[~valid]
+        mean_f0 = np.mean(voiced_f)
 
-        mean_f0 = np.nanmean(f0)
-        ax.plot(times, f0_interp, color=color, linewidth=1.5, alpha=0.85, label=label)
-        ax.axhline(y=mean_f0, color=color, linestyle="--", linewidth=1.5, alpha=0.7,
-                   label=f"{label} 平均F0 = {mean_f0:.0f} Hz")
+        # 浊音F0 — 加粗的实线（只画浊音段）
+        ax.plot(voiced_t, voiced_f, color=color, linewidth=1.8, alpha=0.9)
 
-    ax.set_title("图2: 男/女声基频 (F0) 轮廓对比", fontsize=15, fontweight="bold")
-    ax.set_xlabel("时间 (s)", fontsize=11)
-    ax.set_ylabel("基频 (Hz)", fontsize=11)
-    ax.set_ylim(30, 520)
-    ax.legend(fontsize=11, loc="upper right")
-    ax.grid(True, alpha=0.2)
+        # 清音段用很淡的灰色线标记在底部
+        if len(unvoiced_t) > 0:
+            # 找连续的清音区间
+            gaps = np.diff(np.concatenate([[False], ~valid, [False]]).astype(int))
+            gap_starts = np.where(gaps == 1)[0]
+            gap_ends = np.where(gaps == -1)[0]
+            for gs, ge in zip(gap_starts, gap_ends):
+                if gs < len(times) and ge <= len(times):
+                    ax.axvspan(times[gs], times[min(ge, len(times)) - 1],
+                               alpha=0.08, color="#9ca3af", zorder=0)
 
-    plt.tight_layout()
+        # 平均F0 — 醒目的虚线 + 数值标记
+        ax.axhline(y=mean_f0, color="#dc2626", linestyle="--", linewidth=1.8, alpha=0.85)
+        ax.text(times[-1] * 0.995, mean_f0 + 12, f"均值 {mean_f0:.0f} Hz",
+                ha="right", va="bottom", fontsize=10.5, fontweight="bold",
+                color="#dc2626", bbox=dict(boxstyle="round,pad=0.25", fc="white",
+                alpha=0.85, ec="#fca5a5"))
+
+        # 典型F0范围带
+        ax.axhspan(band[0], band[1], alpha=0.08, color=color)
+        ax.text(0.01, band[1] - 6, band_label, ha="left", va="top",
+                fontsize=9, color=color, alpha=0.7, fontstyle="italic")
+
+        ax.set_ylabel("基频 F0 (Hz)", fontsize=11)
+        ax.set_ylim(30, 520)
+        ax.set_xlim(0, times[-1])
+        ax.grid(True, alpha=0.12)
+        # 加文字标签在左上角
+        ax.text(0.01, 0.94, label, transform=ax.transAxes, fontsize=12,
+                fontweight="bold", color=color, va="top",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85, ec=color))
+
+    ax2.set_xlabel("时间 (s)", fontsize=11)
+    fig.suptitle("图2: 男/女声基频 (F0) 轮廓对比", fontsize=15, fontweight="bold", y=1.01)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.93, bottom=0.07)
     fig.savefig(OUT_DIR / "fig2_f0_contour.png", dpi=200, bbox_inches="tight")
     plt.close()
     print("[OK] 图2: F0轮廓对比")
@@ -235,60 +266,77 @@ def fig5_confusion_matrix():
 # 图6: VAD 人声检测示意图
 # ═══════════════════════════════════════════════════════════════════════════
 def fig6_vad_demo():
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6))
+    # 用真实语音 + 人为插入静音间隙，清楚展示 VAD 工作原理
+    male_fp = sorted((DATA / "male").glob("*.wav"))[30]
+    y_raw, sr_orig = sf.read(str(male_fp), dtype="float32")
+    if y_raw.ndim > 1: y_raw = np.mean(y_raw, axis=1)
+    if sr_orig != SR: y_raw = librosa.resample(y_raw, orig_sr=sr_orig, target_sr=SR)
 
-    # 构造一段"说话-停顿-说话"的模拟波形
-    np.random.seed(42)
-    t_total = np.linspace(0, 4.5, int(4.5 * SR), endpoint=False)
-    y = np.zeros_like(t_total)
-    # 第1段声音: 正弦+谐波模拟
-    m1 = int(0.3 * SR)
-    m2 = int(1.8 * SR)
-    y[m1:m2] = (0.15 * np.sin(2 * np.pi * 150 * t_total[m1:m2])
-                + 0.08 * np.sin(2 * np.pi * 300 * t_total[m1:m2])
-                + 0.04 * np.sin(2 * np.pi * 450 * t_total[m1:m2]))
-    y[m1:m2] += np.random.randn(m2 - m1) * 0.008
-    # 第2段声音
-    m3 = int(2.8 * SR)
-    m4 = int(4.2 * SR)
-    y[m3:m4] = (0.18 * np.sin(2 * np.pi * 200 * t_total[m3:m4])
-                + 0.10 * np.sin(2 * np.pi * 400 * t_total[m3:m4])
-                + 0.05 * np.sin(2 * np.pi * 600 * t_total[m3:m4]))
-    y[m3:m4] += np.random.randn(m4 - m3) * 0.008
+    # 取 3 秒并插入静音间隙
+    y_full = y_raw[:int(3.5 * SR)].copy()
+    y_full[int(1.2 * SR):int(1.7 * SR)] = 0    # 中间停顿
+    y_full[int(2.8 * SR):] = 0                  # 尾部静音
+    t_full = np.arange(len(y_full)) / SR
 
-    # 上: 波形
-    ax1.plot(t_total, y, color="#4b5563", linewidth=0.5)
-    ax1.set_title("时域波形 (含静音段)", fontsize=12, fontweight="bold")
-    ax1.set_ylabel("振幅", fontsize=10)
-    ax1.set_xlim(0, 4.5)
-    ax1.set_ylim(-0.4, 0.4)
-    ax1.grid(True, alpha=0.2)
-    ax1.axvspan(0, 0.3, alpha=0.15, color="red", label="静音")
-    ax1.axvspan(1.8, 2.8, alpha=0.15, color="red")
-    ax1.axvspan(4.2, 4.5, alpha=0.15, color="red")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6),
+                                    gridspec_kw={"hspace": 0.12})
 
-    # 下: 分帧 RMS
-    frame_len = int(SR * 0.1)
-    n_frames = len(y) // frame_len
+    # 上: 波形 + 静音区域高亮
+    ax1.plot(t_full, y_full, color="#374151", linewidth=0.4)
+    ax1.set_ylabel("振幅", fontsize=11)
+    ax1.set_xlim(0, t_full[-1])
+    ax1.set_ylim(-0.45, 0.45)
+    ax1.grid(True, alpha=0.15)
+
+    # 标记静音区间
+    for start, end, label in [(0, 0.08, "句首"), (1.2, 1.7, "句中停顿"), (2.8, 3.5, "句尾")]:
+        ax1.axvspan(start, end, alpha=0.18, color="#ef4444")
+        ax1.text((start + end) / 2, 0.38, label, ha="center", va="center",
+                 fontsize=9, color="#991b1b", fontweight="bold",
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8, ec="none"))
+
+    ax1.set_title("真实语音波形 (含静音段)", fontsize=12, fontweight="bold")
+
+    # 下: 分帧 RMS + 自适应阈值
+    frame_len = int(SR * 0.1)  # 100ms
+    n_frames = len(y_full) // frame_len
     frame_rms = np.array([
-        np.sqrt(np.mean(y[i * frame_len:(i + 1) * frame_len] ** 2))
+        np.sqrt(np.mean(y_full[i * frame_len:(i + 1) * frame_len] ** 2))
         for i in range(n_frames)
     ])
-    frame_times = np.arange(n_frames) * frame_len / SR
+    frame_times = (np.arange(n_frames) + 0.5) * frame_len / SR
 
-    threshold = 0.003
-    ax2.bar(frame_times, frame_rms, width=0.09, color=["#22c55e" if r > threshold else "#ef4444" for r in frame_rms],
-            alpha=0.75, edgecolor="white", linewidth=0.3)
-    ax2.axhline(y=threshold, color="black", linestyle="--", linewidth=1.5, label=f"VAD 阈值 = {threshold:.3f}")
-    ax2.set_title("分帧 RMS 能量 + VAD 阈值", fontsize=12, fontweight="bold")
-    ax2.set_xlabel("时间 (s)", fontsize=10)
-    ax2.set_ylabel("RMS 能量", fontsize=10)
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.2)
-    ax2.set_xlim(0, 4.5)
+    # 自适应阈值 (与 GUI 端 VAD 一致: 第20百分位 × 3)
+    noise_floor = np.percentile(frame_rms, 20)
+    vad_threshold = max(noise_floor * 3.0, 0.0015)
+    active = frame_rms > vad_threshold
+    active_ratio = np.mean(active)
 
-    fig.suptitle("图6: 人声活动检测 (VAD) 工作原理", fontsize=14, fontweight="bold")
-    plt.tight_layout()
+    bar_colors = ["#22c55e" if a else "#ef4444" for a in active]
+    ax2.bar(frame_times, frame_rms, width=0.09, color=bar_colors,
+            alpha=0.78, edgecolor="white", linewidth=0.2)
+    ax2.axhline(y=vad_threshold, color="#1e40af", linestyle="--", linewidth=1.8,
+                label=f"自适应阈值 = {vad_threshold:.4f}  (第20百分位 × 3)")
+    ax2.axhline(y=noise_floor, color="#9ca3af", linestyle=":", linewidth=1.2,
+                label=f"噪声基底 = {noise_floor:.4f}  (第20百分位)")
+    ax2.fill_between(frame_times, 0, vad_threshold, alpha=0.06, color="#1e40af")
+
+    ax2.set_ylabel("RMS 能量", fontsize=11)
+    ax2.set_xlabel("时间 (s)", fontsize=11)
+    ax2.set_xlim(0, t_full[-1])
+    ax2.legend(fontsize=9.5, loc="upper right", framealpha=0.85, edgecolor="#ddd")
+    ax2.grid(True, alpha=0.15)
+
+    # VAD 判定结果标注
+    verdict = "有效语音 [是]" if active_ratio > 0.1 else "无效语音 [否]"
+    verdict_color = "#166534" if active_ratio > 0.1 else "#991b1b"
+    ax2.text(0.98, 0.94, f"有声帧占比: {active_ratio:.1%}  →  {verdict}",
+             transform=ax2.transAxes, ha="right", va="top",
+             fontsize=11, fontweight="bold", color=verdict_color,
+             bbox=dict(boxstyle="round,pad=0.4", fc="white", alpha=0.9, ec="#ddd"))
+
+    fig.suptitle("图6: 人声活动检测 (VAD) — 自适应阈值 + 真实语音", fontsize=14, fontweight="bold", y=1.01)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.93, bottom=0.08)
     fig.savefig(OUT_DIR / "fig6_vad_demo.png", dpi=200, bbox_inches="tight")
     plt.close()
     print("[OK] 图6: VAD演示")

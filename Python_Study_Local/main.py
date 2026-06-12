@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 import joblib
 import librosa
 import numpy as np
+from scipy.signal import butter, filtfilt
 import pandas as pd
 import pyworld as pw
 import soundfile as sf
@@ -282,48 +283,49 @@ def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> fl
     strength = _clamp_control(strength)
     if mean_f0 <= 0:
         if target == "female":
-            return 1.40 + 0.35 * strength
+            return 1.55 + 0.45 * strength
         elif target == "male":
-            return 0.82 - 0.15 * strength
+            return 0.70 - 0.22 * strength
         return 1.0
     if target == "female":
-        target_f0 = 210.0 + 80.0 * strength
+        target_f0 = 225.0 + 90.0 * strength
         ratio = target_f0 / mean_f0
-        min_ratio = 0.95
-        max_ratio = 1.50 + 0.55 * strength
+        min_ratio = 0.90
+        max_ratio = 1.60 + 0.65 * strength
         return float(np.clip(ratio, min_ratio, max_ratio))
     if target == "male":
-        target_f0 = 130.0 - 45.0 * strength
+        target_f0 = 120.0 - 55.0 * strength
         ratio = target_f0 / mean_f0
-        min_ratio = 0.85 - 0.30 * strength
+        min_ratio = 0.65 - 0.40 * strength
         max_ratio = 1.05
         return float(np.clip(ratio, min_ratio, max_ratio))
     return 1.0
 
 
 def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55) -> float:
+    """共振峰偏移因子：限制在生理合理范围内（±20%）避免非人音色"""
     strength = _clamp_control(strength)
     if target == "female":
-        base = 1.08 + 0.10 * strength
-        power = 0.22 + 0.08 * strength
-        min_factor = 0.80
-        max_factor = 1.22 + 0.14 * strength
+        base = 1.05 + 0.07 * strength
+        power = 0.12 + 0.06 * strength
+        min_factor = 0.82
+        max_factor = 1.16 + 0.10 * strength
     elif target == "male":
-        base = 0.95 - 0.12 * strength
-        power = 0.35 + 0.10 * strength
-        min_factor = 0.78 - 0.15 * strength
-        max_factor = 1.20
+        base = 0.92 - 0.08 * strength
+        power = 0.15 + 0.08 * strength
+        min_factor = 0.80 - 0.08 * strength
+        max_factor = 1.18
     else:
         base = 1.0
-        power = 0.30
-        min_factor = 0.75
-        max_factor = 1.30
+        power = 0.15
+        min_factor = 0.78
+        max_factor = 1.22
     return float(np.clip(base * (f0_ratio ** power), min_factor, max_factor))
 
 
 def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
-    """频域拉伸共振峰，混入原声保留音色，避免过度扭曲"""
-    if factor == 1.0:
+    """极保守共振峰移位：仅提供微弱的元音品质线索，避免伪影"""
+    if abs(factor - 1.0) < 0.01:
         return sp
     n_frames, n_bins = sp.shape
     freqs = np.linspace(0.0, sr / 2.0, n_bins)
@@ -331,114 +333,168 @@ def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarra
     warped = np.empty_like(sp)
     for idx in range(n_frames):
         warped[idx] = np.interp(freqs, src_freqs, sp[idx], left=sp[idx, 0], right=sp[idx, -1])
-    # 混入 30% 原声，保留自然音色
-    blend = 0.30 + 0.40 * abs(factor - 1.0)
-    blend = min(blend, 0.70)
+    # 极轻混合：仅 10-22% 变形谱，保留自然度
+    blend = 0.10 + 0.12 * abs(factor - 1.0)
+    blend = min(blend, 0.22)
     return sp * (1.0 - blend) + warped * blend
 
 
 def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) -> np.ndarray:
+    """多段非线性频谱整形：激进增益确保音色变化可感知（3-8dB）"""
     brightness = _clamp_control(brightness)
+    n_bins = sp.shape[1]
+    nyq = 11025.0
+    freqs = np.linspace(0.0, nyq, n_bins)
+
     if target == "female":
-        low_gain = 0.98 - 0.05 * brightness
-        high_gain = 1.03 + 0.10 * brightness
-        tilt = np.linspace(low_gain, high_gain, sp.shape[1], dtype=np.float64)
-        return sp * tilt
-    if target == "male":
-        low_gain = 1.00 + 0.05 * brightness
-        high_gain = 0.99 - 0.06 * brightness
-        tilt = np.linspace(low_gain, high_gain, sp.shape[1], dtype=np.float64)
-        return sp * tilt
-    return sp
+        # 男→女：狠削低频(去男声厚度) + 增强1-3kHz(加女声明亮) + 高频不过激
+        ctrl_f = np.array([0.0, 220.0, 550.0, 1500.0, 3200.0, nyq])
+        ctrl_g = np.array([
+            0.50 - 0.22 * brightness,   # 50Hz:  深削最低频 (-50~-65%)
+            0.60 - 0.18 * brightness,   # 220Hz: 强削低音
+            0.92 + 0.06 * brightness,   # 550Hz: 近中性
+            1.08 + 0.18 * brightness,   # 1500Hz: 增强女声存在感
+            1.02 + 0.15 * brightness,   # 3200Hz: 适度增亮(避免尖细)
+            0.97 + 0.06 * brightness,   # 11025Hz: 接近平坦
+        ])
+    elif target == "male":
+        # 女→男：大幅增强低频 + 大幅削弱高频
+        ctrl_f = np.array([0.0, 250.0, 600.0, 1500.0, 3500.0, nyq])
+        ctrl_g = np.array([
+            1.35 + 0.28 * brightness,   # 50Hz:  强增最低频 (+35~+54%)
+            1.25 + 0.22 * brightness,   # 250Hz: 大幅增强低音
+            1.03 + 0.05 * brightness,   # 600Hz: 中性偏强
+            0.88 - 0.12 * brightness,   # 1500Hz: 开始削弱
+            0.72 - 0.25 * brightness,   # 3500Hz: 大幅削弱 (-20~-40%)
+            0.65 - 0.25 * brightness,   # 11025Hz: 强削高频 (-25~-42%)
+        ])
+    else:
+        return sp
+
+    tilt = np.interp(freqs, ctrl_f, ctrl_g)
+    return sp * tilt.astype(np.float64)
 
 
 def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target: str, strength: float) -> np.ndarray:
-    """频率自适应的频谱混合：低频保留原声（保持音色），高频使用转换（调整音高感受）"""
+    """频谱混合：高比例倾斜谱确保音色变化可感知"""
     strength = _clamp_control(strength)
     n_bins = sp_original.shape[1]
 
-    mix_base = np.linspace(0.20, 0.65, n_bins, dtype=np.float64)
-    mix_ratio = mix_base + strength * 0.25
+    mix_base = np.linspace(0.82, 0.92, n_bins, dtype=np.float64)
+    mix_ratio = mix_base + strength * 0.06
 
     if target == "female":
-        mix_ratio += 0.03
+        mix_ratio += 0.02
     elif target == "male":
-        mix_ratio -= 0.02
+        mix_ratio -= 0.01
 
-    mix_ratio = np.clip(mix_ratio, 0.18, 0.85)
+    mix_ratio = np.clip(mix_ratio, 0.65, 0.96)
     return sp_original * (1.0 - mix_ratio) + sp_converted * mix_ratio
 
 
-def _smooth_f0(f0: np.ndarray, window: int = 7) -> np.ndarray:
-    """三阶段F0平滑：中值去野 → 低通消阶梯 → 插值填空洞，减少电音"""
+def _smooth_f0(f0: np.ndarray, window: int = 5) -> np.ndarray:
+    """两阶段F0平滑：仅处理有声帧，清音帧保持0值避免合成电音"""
     if window <= 1:
         return f0
     half = window // 2
     smoothed = f0.copy()
+    voiced_mask = f0 > 0
 
-    # 阶段1：中值滤波（移除离群值），窗口加大到7
-    for idx in range(f0.size):
+    # 阶段1：仅对有声帧做中值滤波
+    for idx in np.where(voiced_mask)[0]:
         start = max(0, idx - half)
         end = min(f0.size, idx + half + 1)
-        voiced = f0[start:end]
-        voiced = voiced[voiced > 0]
-        if voiced.size:
-            smoothed[idx] = float(np.median(voiced))
+        neighborhood = f0[start:end]
+        voiced_neighbors = neighborhood[neighborhood > 0]
+        if voiced_neighbors.size:
+            smoothed[idx] = float(np.median(voiced_neighbors))
 
-    # 阶段2：有声段移动平均低通，消除中值滤波的阶梯状（机械电音主因）
-    voiced_mask = smoothed > 0
-    if np.any(voiced_mask):
-        smoothed_ma = smoothed.copy()
-        for idx in range(smoothed.size):
-            start = max(0, idx - 2)
-            end = min(smoothed.size, idx + 3)
-            neighborhood = smoothed[start:end]
-            voiced_neighbors = neighborhood[neighborhood > 0]
-            if voiced_neighbors.size >= 2:
-                smoothed_ma[idx] = float(np.mean(voiced_neighbors))
-        # 只在有声段应用低通结果
-        smoothed[voiced_mask] = smoothed_ma[voiced_mask]
-
-    # 阶段3：局部线性插值（填充短空洞，扩大范围到10帧）
-    voiced_indices = np.where(smoothed > 0)[0]
-    if len(voiced_indices) > 1:
-        for seg_start_idx in range(len(voiced_indices) - 1):
-            idx_a = voiced_indices[seg_start_idx]
-            idx_b = voiced_indices[seg_start_idx + 1]
-            if idx_b - idx_a <= 10:
-                smoothed[idx_a:idx_b + 1] = np.linspace(
-                    smoothed[idx_a], smoothed[idx_b], idx_b - idx_a + 1)
+    # 阶段2：局部线性插值（仅填充有声段之间的短间隙，不碰大段清音）
+    smoothed_voiced = np.where(smoothed > 0)[0]
+    if len(smoothed_voiced) > 1:
+        for i in range(len(smoothed_voiced) - 1):
+            a, b = smoothed_voiced[i], smoothed_voiced[i + 1]
+            if b - a <= 6:  # 最多6帧(~30ms)间隙
+                smoothed[a:b + 1] = np.linspace(smoothed[a], smoothed[b], b - a + 1)
 
     return smoothed
 
 
+def _adjust_f0_prosody(f0: np.ndarray, target: str, strength: float) -> np.ndarray:
+    """调整F0变化幅度：男→女扩幅(更抑扬顿挫)，女→男收幅(更平稳)"""
+    voiced = f0[f0 > 0]
+    if len(voiced) < 3:
+        return f0
+    mean_f0 = np.mean(voiced)
+    result = f0.copy()
+    if target == "female":
+        expand = 1.0 + 0.25 * strength  # 扩幅至125%
+    elif target == "male":
+        expand = 1.0 - 0.22 * strength  # 收幅至78%
+    else:
+        return f0
+    # 以均值为中心缩放偏差
+    voiced_mask = f0 > 0
+    result[voiced_mask] = mean_f0 + (f0[voiced_mask] - mean_f0) * expand
+    result[voiced_mask] = np.clip(result[voiced_mask], 50.0, 500.0)
+    return result
+
+
+def _adjust_formant_bands(sp: np.ndarray, sr: int, target: str, strength: float) -> np.ndarray:
+    """非均匀共振峰移位：低频轻移(保结构)，中频重移(改音色)，高频中移"""
+    n_bins = sp.shape[1]
+    freqs = np.linspace(0.0, sr / 2.0, n_bins)
+
+    if target == "female":
+        # 男→女：共振峰上移，低频段少移(保谐波)，中频段多移(改元音品质)
+        shift = np.ones(n_bins, dtype=np.float64)
+        for i, f in enumerate(freqs):
+            if f < 500:
+                shift[i] = 1.0 + 0.04 * strength  # 低频: 1-4%上移
+            elif f < 2000:
+                shift[i] = 1.0 + 0.12 * strength  # F1/F2区域: 12%上移
+            elif f < 5000:
+                shift[i] = 1.0 + 0.08 * strength  # F3区域: 8%上移
+            else:
+                shift[i] = 1.0 + 0.03 * strength  # 高频: 轻移
+    elif target == "male":
+        # 女→男：共振峰下移，非均匀分布
+        shift = np.ones(n_bins, dtype=np.float64)
+        for i, f in enumerate(freqs):
+            if f < 500:
+                shift[i] = 1.0 - 0.03 * strength
+            elif f < 2000:
+                shift[i] = 1.0 - 0.11 * strength  # F1/F2区域
+            elif f < 5000:
+                shift[i] = 1.0 - 0.07 * strength
+            else:
+                shift[i] = 1.0 - 0.02 * strength
+    else:
+        return sp
+
+    src_freqs = freqs / shift
+    warped = np.empty_like(sp)
+    for idx in range(sp.shape[0]):
+        warped[idx] = np.interp(freqs, src_freqs, sp[idx],
+                                 left=sp[idx, 0], right=sp[idx, -1])
+    # 轻混合，保留自然度
+    blend = 0.25 + 0.15 * strength
+    blend = min(blend, 0.45)
+    return sp * (1.0 - blend) + warped * blend
+
+
 def _smooth_spectral_envelope(sp: np.ndarray, window: int = 5) -> np.ndarray:
-    """两步频谱平滑，保留清晰度同时减少噪声"""
+    """频谱包络平滑：仅频率维同态滤波，去掉时间维平滑避免电音"""
     if window <= 1:
         return sp
-    
-    # 第一阶段：频率维度平滑（倒谱平滑）
+
     log_sp = np.log(sp + 1e-12)
     kernel = np.ones(window, dtype=np.float64) / window
-    
+
     smoothed = np.empty_like(log_sp)
     for idx in range(log_sp.shape[0]):
         smoothed[idx] = np.convolve(log_sp[idx], kernel, mode="same")
-    
-    # 第二阶段：时间维度平滑（避免帧间的剧烈跳变）
-    if smoothed.shape[0] > 1:
-        kernel_time = np.array([0.25, 0.5, 0.25], dtype=np.float64)
-        smoothed_time = np.zeros_like(smoothed)
-        smoothed_time[0] = smoothed[0]
-        for frame_idx in range(1, smoothed.shape[0] - 1):
-            smoothed_time[frame_idx] = (
-                0.25 * smoothed[frame_idx - 1] +
-                0.5 * smoothed[frame_idx] +
-                0.25 * smoothed[frame_idx + 1]
-            )
-        smoothed_time[-1] = smoothed[-1]
-        smoothed = smoothed_time
-    
+
     return np.exp(smoothed)
 
 
@@ -453,16 +509,26 @@ def _adjust_aperiodicity(ap: np.ndarray, f0: np.ndarray, f0_ratio: float, target
 
     if target == "female":
         intensity = float(np.clip((f0_ratio - 1.0) / 1.2, 0.0, 1.0))
-        hf_boost = 1.0 + 0.06 * intensity
+        hf_boost = 1.0 + 0.12 * intensity
         hf_mask = np.linspace(1.0, hf_boost, n_bins)
         adjusted[voiced_mask] = ap[voiced_mask] * hf_mask
     elif target == "male":
         intensity = float(np.clip((1.0 - f0_ratio) / 0.6, 0.0, 1.0))
-        hf_cut = 1.0 - 0.06 * intensity
+        hf_cut = 1.0 - 0.10 * intensity
         hf_mask = np.linspace(1.0, hf_cut, n_bins)
         adjusted[voiced_mask] = ap[voiced_mask] * hf_mask
 
     return np.clip(adjusted, 0.0, 1.0)
+
+
+def _post_process(y: np.ndarray, sr: int, cutoff: float = 7500.0) -> np.ndarray:
+    """合成后处理：Butterworth低通滤波去除WORLD高频伪影/电音"""
+    nyq = sr / 2.0
+    normal_cutoff = cutoff / nyq
+    if normal_cutoff >= 0.99:
+        return y
+    b, a = butter(4, normal_cutoff, btype="low")
+    return filtfilt(b, a, y).astype(y.dtype)
 
 
 def _detect_voice_activity(y: np.ndarray, sr: int, min_rms: float = 0.005) -> bool:
