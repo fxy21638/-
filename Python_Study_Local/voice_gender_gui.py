@@ -96,7 +96,7 @@ from main import (
     extract_audio_features,
     _ensure_min_duration,
     _smooth_f0,
-    _warp_spectral_envelope,
+    _shift_formant_envelope,
     _apply_spectral_tilt,
     _mix_with_original,
     _clamp_control,
@@ -104,6 +104,7 @@ from main import (
     _adjust_aperiodicity,
     _trim_silence,
     _post_process,
+    predict_gender_segmented,
 )
 
 
@@ -198,6 +199,8 @@ class PredictWorker(QThread):
                         "status": "success",
                         "gender": "unknown",
                         "confidence": 0,
+                        "vote_detail": {"male": 0, "female": 0, "unknown": 0},
+                        "segment_count": 0,
                         "display_features": {
                             "mean_frequency": 0.0,
                             "mean_pitch": 0.0,
@@ -209,15 +212,38 @@ class PredictWorker(QThread):
                     return
 
             model, feature_names, label_mapping = _load_model()
-            y_trimmed = _trim_silence(y, self._sr)
-            y_for_feature = _ensure_min_duration(y_trimmed, self._sr, min_duration=1.2)
-            feature_df = extract_audio_features(y_for_feature, self._sr, feature_names)
 
-            raw_proba = model.predict_proba(feature_df)[0]
-            pred_prob = float(raw_proba.max())
-            pred_label = int(model.predict(feature_df)[0])
-            raw_gender_cn = str(label_mapping.get(pred_label, pred_label))
+            # 分段预测 + 投票
+            seg_result = predict_gender_segmented(y, self._sr, model, feature_names)
+            vote = seg_result["vote_detail"]
+            total_seg = seg_result["segment_count"]
+            raw_gender = seg_result["gender"]
+
+            if raw_gender == "unknown":
+                self.result_ready.emit({
+                    "status": "success",
+                    "gender": "unknown",
+                    "confidence": 0,
+                    "vote_detail": vote,
+                    "segment_count": total_seg,
+                    "display_features": {
+                        "mean_frequency": 0.0,
+                        "mean_pitch": 0.0,
+                        "amplitude": round(float(np.max(np.abs(y))), 4) if y.size else 0.0,
+                        "duration": round(duration, 3),
+                    },
+                    "debug": {"message": "未检测到足够人声"},
+                })
+                return
+
+            raw_gender_cn = "男性" if raw_gender == "male" else "女性"
             predicted_gender = GENDER_MAP.get(raw_gender_cn, raw_gender_cn)
+            confidence = seg_result["confidence"]
+
+            # 单次全局特征提取（仅用于调试信息，不影响预测结果）
+            # 注意：不用 _trim_silence，与训练时特征提取保持一致
+            y_for_feature = _ensure_min_duration(y, self._sr, min_duration=1.2)
+            feature_df = extract_audio_features(y_for_feature, self._sr, feature_names)
 
             recent_y = y[-int(self._sr) :] if y.size > self._sr else y
 
@@ -241,23 +267,20 @@ class PredictWorker(QThread):
                     if val < ref_min * 0.5 or val > ref_max * 1.5:
                         outliers.append(f"{col}={val:.4f}(ref:[{ref_min:.4f},{ref_max:.4f}])")
 
-            # 附加辅助特征到调试信息
-            aux_features = {}
-            for k in ["fun_range", "freq_fun_ratio", "low_energy_ratio"]:
-                if k in feature_df.columns:
-                    aux_features[k] = round(float(feature_df[k].iloc[0]), 4)
             result = {
                 "status": "success",
                 "gender": predicted_gender,
-                "confidence": round(pred_prob * 100, 1),
+                "confidence": confidence,
+                "vote_detail": vote,
+                "segment_count": total_seg,
                 "display_features": display_features,
                 "debug": {
                     "raw_prediction": raw_gender_cn,
-                    "model_proba": f"{pred_prob:.4f}",
+                    "model_proba": f"{confidence / 100:.4f}",
                     "duration": f"{duration:.1f}s",
                     "features": all_features,
                     "outliers": outliers,
-                    "aux_features": aux_features,
+                    "aux_features": {},
                 },
             }
             self.result_ready.emit(result)
@@ -300,11 +323,7 @@ class ConvertWorker(QThread):
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
 
             f0_converted = _smooth_f0(f0 * f0_ratio)
-            if target == "female":
-                formant_factor = 1.06 + 0.10 * strength
-            else:
-                formant_factor = 0.96 - 0.08 * strength
-            sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
+            sp_converted = _shift_formant_envelope(sp, sr, target, strength)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
             ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
@@ -493,6 +512,10 @@ class VoiceGenderWindow(QMainWindow):
         self.confidence_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.confidence_label.setStyleSheet("font-size: 15px; color: #b91c1c;")
         result_layout.addWidget(self.confidence_label)
+        self.ratio_label = QLabel("")
+        self.ratio_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ratio_label.setStyleSheet("font-size: 13px; color: #64748b; padding-top: 2px;")
+        result_layout.addWidget(self.ratio_label)
         note = QLabel("※ 当前模型仅支持正常说话声，唱歌/假声/吼叫等可能误判")
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         note.setStyleSheet("font-size: 11px; color: #9ca3af; padding-top: 4px;")
@@ -648,11 +671,7 @@ class VoiceGenderWindow(QMainWindow):
             f0_ratio = _compute_f0_ratio(mean_f0, target, strength)
 
             f0_converted = _smooth_f0(f0 * f0_ratio)
-            if target == "female":
-                formant_factor = 1.06 + 0.10 * strength
-            else:
-                formant_factor = 0.96 - 0.08 * strength
-            sp_converted = _warp_spectral_envelope(sp, sr, formant_factor)
+            sp_converted = _shift_formant_envelope(sp, sr, target, strength)
             sp_converted = _apply_spectral_tilt(sp_converted, target, brightness)
             sp_converted = _mix_with_original(sp, sp_converted, target, strength)
             ap_converted = _adjust_aperiodicity(ap, f0_converted, f0_ratio, target)
@@ -994,10 +1013,13 @@ class VoiceGenderWindow(QMainWindow):
                 if self._last_displayed_gender != "unknown":
                     self.gender_label.setText("未检测到人声")
                     self.confidence_label.setText("置信度：--%")
+                    self.ratio_label.setText("")
                     self._last_displayed_gender = "unknown"
         else:
             self._unknown_streak = 0
             new_label = str(gender)
+            # 实时预测不显示比例（3s窗口始终100%），仅文件上传时显示
+            self.ratio_label.setText("")
             if self._last_displayed_gender == new_label:
                 self._gender_streak = 0
                 self._pending_gender = None
@@ -1021,7 +1043,11 @@ class VoiceGenderWindow(QMainWindow):
         if "message" in dbg:
             lines.append(dbg["message"])
         else:
-            lines.append(f"预测: {dbg.get('raw_prediction', '?')} | 概率: {dbg.get('model_proba', '?')}")
+            vote = result.get("vote_detail", {})
+            seg_n = result.get("segment_count", 0)
+            lines.append(f"预测: {dbg.get('raw_prediction', '?')} | "
+                         f"分段投票: 男{vote.get('male',0)} 女{vote.get('female',0)} "
+                         f"静{vote.get('unknown',0)} (共{seg_n}段)")
             lines.append(f"时长: {dbg.get('duration', '?')}")
             feats = dbg.get("features", {})
             if feats:
@@ -1120,9 +1146,16 @@ class VoiceGenderWindow(QMainWindow):
         if gender == "unknown":
             self.gender_label.setText("未检测到人声")
             self.confidence_label.setText("置信度：--%")
+            self.ratio_label.setText("")
         else:
             self.gender_label.setText(gender)
             self.confidence_label.setText(f"置信度：{result['confidence']}%")
+            vote = result.get("vote_detail", {})
+            total = sum(vote.values())
+            if total > 0:
+                m_pct = vote.get("male", 0) / total * 100
+                f_pct = vote.get("female", 0) / total * 100
+                self.ratio_label.setText(f"男声 {m_pct:.0f}%  ·  女声 {f_pct:.0f}%")
 
         # 显示完整调试信息
         dbg = result.get("debug", {})
@@ -1130,7 +1163,10 @@ class VoiceGenderWindow(QMainWindow):
         if "message" in dbg:
             lines.append(dbg["message"])
         else:
-            lines.append(f"原始预测: {dbg.get('raw_prediction', '?')} | 概率: {dbg.get('model_proba', '?')}")
+            vote = result.get("vote_detail", {})
+            seg_n = result.get("segment_count", 0)
+            lines.append(f"分段投票: 男{vote.get('male',0)} 女{vote.get('female',0)} "
+                         f"静{vote.get('unknown',0)} (共{seg_n}段)")
             lines.append(f"时长: {dbg.get('duration', '?')}")
             lines.append("─" * 40)
             lines.append("全部特征:")

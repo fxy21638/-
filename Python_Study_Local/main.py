@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 import joblib
 import librosa
 import numpy as np
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, argrelextrema
 import pandas as pd
 import pyworld as pw
 import soundfile as sf
@@ -236,6 +236,98 @@ def extract_audio_features(y: np.ndarray, sr: int, feature_names: list) -> pd.Da
     return pd.DataFrame([features])[feature_names]
 
 
+def predict_gender_segmented(
+    y: np.ndarray, sr: int, model, feature_names: list,
+    window_s: float = 2.5, step_s: float = 0.8,
+) -> dict:
+    """
+    全局+分段混合预测。
+
+    长音频(>=3s)：全局特征预测作为主结果，分段投票用于显示男女声占比。
+    短音频(<3s)：单次预测。
+
+    Returns:
+        dict with keys: gender, confidence, vote_detail, segment_count
+    """
+    total_samples = y.size
+    total_duration = total_samples / sr
+
+    # ── 全局预测（始终运行，作为主结果） ──
+    # 注意：不用 _trim_silence，保持与训练时特征提取一致
+    y_for_feature = _ensure_min_duration(y, sr, min_duration=1.2)
+    feature_df = extract_audio_features(y_for_feature, sr, feature_names)
+    global_proba = model.predict_proba(feature_df.values)[0]
+    global_pred = int(model.predict(feature_df.values)[0])
+    global_gender = "male" if global_pred == 1 else "female"
+    global_conf = float(global_proba.max())
+
+    # ── 分段投票（用于男女声占比显示） ──
+    window_samples = int(window_s * sr)
+    step_samples = int(step_s * sr)
+    votes = {"male": 0, "female": 0, "unknown": 0}
+    segment_probas = []
+    n_segments = 0
+
+    if total_samples >= window_samples:
+        for start in range(0, total_samples - window_samples + 1, step_samples):
+            segment = y[start:start + window_samples]
+            rms = float(np.sqrt(np.mean(segment ** 2)))
+            if rms < 0.0015:
+                votes["unknown"] += 1
+                continue
+            try:
+                seg_trimmed = _trim_silence(segment, sr)
+                seg_pad = _ensure_min_duration(seg_trimmed, sr, min_duration=1.0)
+                feats = extract_audio_features(seg_pad, sr, feature_names)
+                proba = model.predict_proba(feats.values)[0]
+                pred = int(model.predict(feats.values)[0])
+                conf = float(proba.max())
+                if conf < 0.55:
+                    votes["unknown"] += 1
+                else:
+                    votes["male"] += int(pred == 1)
+                    votes["female"] += int(pred == 0)
+                segment_probas.append(proba)
+                n_segments += 1
+            except Exception:
+                votes["unknown"] += 1
+    else:
+        # 短音频：分段结果 = 全局结果
+        if global_gender == "male":
+            votes["male"] = 1
+        else:
+            votes["female"] = 1
+        n_segments = 1
+        segment_probas.append(global_proba)
+
+    # ── 综合置信度 ──
+    valid_votes = votes["male"] + votes["female"]
+    if valid_votes > 0:
+        vote_agree = votes.get("male" if global_gender == "male" else "female", 0)
+        vote_ratio = vote_agree / valid_votes
+        confidence = round(float(global_conf) * (0.5 + 0.5 * vote_ratio) * 100, 1)
+    else:
+        confidence = round(global_conf * 100, 1)
+
+    # 无有效段时回退到全局结果
+    if n_segments == 0 or (votes["male"] + votes["female"] == 0):
+        return {
+            "gender": global_gender,
+            "confidence": round(global_conf * 100, 1),
+            "vote_detail": {"male": 1 if global_gender == "male" else 0,
+                            "female": 0 if global_gender == "male" else 1,
+                            "unknown": 0},
+            "segment_count": 1,
+        }
+
+    return {
+        "gender": global_gender,
+        "confidence": confidence,
+        "vote_detail": votes,
+        "segment_count": n_segments,
+    }
+
+
 def _smooth_prediction(current_gender: str, current_prob: float) -> tuple[str, float]:
     """
     简单多数投票平滑：最近 5 次中出现次数最多的性别即为输出。
@@ -325,20 +417,120 @@ def _compute_formant_factor(target: str, f0_ratio: float, strength: float = 0.55
     return float(np.clip(base * (f0_ratio ** power), min_factor, max_factor))
 
 
-def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
-    """极保守共振峰移位：仅提供微弱的元音品质线索，避免伪影"""
-    if abs(factor - 1.0) < 0.01:
+def _estimate_formant_peaks(sp_frame: np.ndarray, freqs: np.ndarray,
+                            n_formants: int = 4) -> list:
+    """从单帧频谱包络中检测共振峰频率（峰值检测+频段约束）"""
+    # 在 log 域找峰，避免幅度差异淹没弱峰
+    log_sp = np.log(sp_frame + 1e-12)
+    # 5点局部极大值
+    peak_indices = argrelextrema(log_sp, np.greater, order=5)[0]
+    if len(peak_indices) == 0:
+        return []
+
+    peak_freqs = freqs[peak_indices]
+    peak_amps = sp_frame[peak_indices]
+
+    # 共振峰频段（男女通用窗口）
+    bands = [(200, 900), (800, 2400), (2000, 3500), (3000, 4800)]
+    formants = []
+    for lo, hi in bands[:n_formants]:
+        mask = (peak_freqs >= lo) & (peak_freqs <= hi)
+        if mask.any():
+            best = peak_indices[mask][np.argmax(peak_amps[mask])]
+            formants.append((float(freqs[best]), int(best), float(sp_frame[best])))
+    return formants
+
+
+def _shift_formant_envelope(sp: np.ndarray, sr: int, target: str,
+                            strength: float = 0.55) -> np.ndarray:
+    """
+    基于共振峰检测的频谱包络移位。
+
+    对每帧检测 F1-F4，按目标性别成比例移位（女↑15-20%, 男↓10-15%），
+    在共振峰区域局部拉伸/压缩包络，而非全局均匀 warping。
+    """
+    strength = _clamp_control(strength)
+    n_frames, n_bins = sp.shape
+    nyq = sr / 2.0
+    freqs = np.linspace(0.0, nyq, n_bins)
+
+    if target == "female":
+        # 男→女：共振峰上移 15-25%
+        shift_ratio = 1.15 + 0.10 * strength
+    elif target == "male":
+        # 女→男：共振峰下移 10-20%
+        shift_ratio = 0.90 - 0.10 * strength
+    else:
         return sp
+
+    result = sp.copy()
+    n_shifted = 0
+
+    for idx in range(n_frames):
+        formants = _estimate_formant_peaks(sp[idx], freqs)
+        if len(formants) < 2:
+            continue
+
+        n_shifted += 1
+        # 对每个共振峰区域做局部频域拉伸
+        for f_center, f_bin, _ in formants:
+            # 计算该共振峰区域的范围（±30%频宽）
+            half_width = int(f_bin * 0.30)
+            lo = max(0, f_bin - half_width)
+            hi = min(n_bins - 1, f_bin + half_width)
+            if hi - lo < 3:
+                continue
+
+            # 目标中心频率
+            target_center = f_center * shift_ratio
+            target_bin = np.searchsorted(freqs, target_center)
+            target_bin = int(np.clip(target_bin, lo, hi))
+
+            # 局部拉伸：将 [lo, hi] 区域按比例缩放
+            scale = target_center / f_center
+            # 目标频率网格（输出位置）
+            target_freqs = freqs[lo:hi + 1]
+            # 源频率位置：输出频率 f 对应的输入频率 = f/scale
+            src_freqs = target_freqs / scale
+            # 在全帧频谱上插值，从源频率取谱值放到目标频率位置
+            warped_region = np.interp(src_freqs, freqs, sp[idx],
+                                      left=sp[idx, 0], right=sp[idx, -1])
+            # 仅在该区域内混合
+            blend = 0.35 + 0.20 * strength
+            blend = min(blend, 0.60)
+            result[idx, lo:hi + 1] = (
+                sp[idx, lo:hi + 1] * (1.0 - blend) + warped_region * blend
+            )
+
+    # 若无共振峰帧被处理，回退到全局 warping
+    if n_shifted < n_frames * 0.1:
+        return _warp_spectral_envelope_fallback(sp, sr, shift_ratio)
+
+    return result
+
+
+def _warp_spectral_envelope_fallback(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
+    """全局频率轴拉伸（回退方案）"""
     n_frames, n_bins = sp.shape
     freqs = np.linspace(0.0, sr / 2.0, n_bins)
     src_freqs = freqs / factor
     warped = np.empty_like(sp)
     for idx in range(n_frames):
-        warped[idx] = np.interp(freqs, src_freqs, sp[idx], left=sp[idx, 0], right=sp[idx, -1])
-    # 极轻混合：仅 10-22% 变形谱，保留自然度
-    blend = 0.10 + 0.12 * abs(factor - 1.0)
-    blend = min(blend, 0.22)
+        warped[idx] = np.interp(freqs, src_freqs, sp[idx],
+                                left=sp[idx, 0], right=sp[idx, -1])
+    blend = 0.15 + 0.10 * abs(factor - 1.0)
+    blend = min(blend, 0.30)
     return sp * (1.0 - blend) + warped * blend
+
+
+def _warp_spectral_envelope(sp: np.ndarray, sr: int, factor: float) -> np.ndarray:
+    """保留旧接口，内部委托 _shift_formant_envelope（target 从 factor 推断）"""
+    # factor > 1 → female, factor < 1 → male
+    if abs(factor - 1.0) < 0.01:
+        return sp
+    target = "female" if factor > 1.0 else "male"
+    strength = min(abs(factor - 1.0) / 0.25, 1.0)
+    return _shift_formant_envelope(sp, sr, target, strength)
 
 
 def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) -> np.ndarray:
