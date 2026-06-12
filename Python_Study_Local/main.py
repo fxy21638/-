@@ -218,6 +218,8 @@ def extract_audio_features(y: np.ndarray, sr: int, feature_names: list) -> pd.Da
     try:
         f0 = librosa.yin(y, fmin=50, fmax=500, sr=sr)
         f0 = f0[np.isfinite(f0)]
+        # 剔除清音/噪音帧产生的虚假F0值（yin对所有帧输出估计，>450Hz基本是伪迹）
+        f0 = f0[(f0 >= 50) & (f0 <= 450)]
     except Exception:
         f0 = np.array([])
 
