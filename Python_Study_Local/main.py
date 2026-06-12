@@ -382,10 +382,10 @@ def _compute_f0_ratio(mean_f0: float, target: str, strength: float = 0.55) -> fl
             return 0.70 - 0.22 * strength
         return 1.0
     if target == "female":
-        target_f0 = 225.0 + 90.0 * strength
+        target_f0 = 200.0 + 60.0 * strength
         ratio = target_f0 / mean_f0
         min_ratio = 0.90
-        max_ratio = 1.60 + 0.65 * strength
+        max_ratio = 1.80 + 0.80 * strength
         return float(np.clip(ratio, min_ratio, max_ratio))
     if target == "male":
         target_f0 = 120.0 - 55.0 * strength
@@ -455,8 +455,8 @@ def _shift_formant_envelope(sp: np.ndarray, sr: int, target: str,
     freqs = np.linspace(0.0, nyq, n_bins)
 
     if target == "female":
-        # 男→女：共振峰上移 15-25%
-        shift_ratio = 1.15 + 0.10 * strength
+        # 男→女：共振峰上移 18-33%
+        shift_ratio = 1.18 + 0.15 * strength
     elif target == "male":
         # 女→男：共振峰下移 10-20%
         shift_ratio = 0.90 - 0.10 * strength
@@ -496,8 +496,8 @@ def _shift_formant_envelope(sp: np.ndarray, sr: int, target: str,
             warped_region = np.interp(src_freqs, freqs, sp[idx],
                                       left=sp[idx, 0], right=sp[idx, -1])
             # 仅在该区域内混合
-            blend = 0.35 + 0.20 * strength
-            blend = min(blend, 0.60)
+            blend = 0.50 + 0.25 * strength
+            blend = min(blend, 0.75)
             result[idx, lo:hi + 1] = (
                 sp[idx, lo:hi + 1] * (1.0 - blend) + warped_region * blend
             )
@@ -541,14 +541,14 @@ def _apply_spectral_tilt(sp: np.ndarray, target: str, brightness: float = 0.55) 
     freqs = np.linspace(0.0, nyq, n_bins)
 
     if target == "female":
-        # 男→女：狠削低频(去男声厚度) + 增强1-3kHz(加女声明亮) + 高频不过激
+        # 男→女：削低频去男声厚度 + 中高频保持自然(避免meandom/centroid越界)
         ctrl_f = np.array([0.0, 220.0, 550.0, 1500.0, 3200.0, nyq])
         ctrl_g = np.array([
             0.50 - 0.22 * brightness,   # 50Hz:  深削最低频 (-50~-65%)
             0.60 - 0.18 * brightness,   # 220Hz: 强削低音
             0.92 + 0.06 * brightness,   # 550Hz: 近中性
-            1.08 + 0.18 * brightness,   # 1500Hz: 增强女声存在感
-            1.02 + 0.15 * brightness,   # 3200Hz: 适度增亮(避免尖细)
+            0.98 + 0.08 * brightness,   # 1500Hz: 微调(避免推高meandom)
+            0.95 + 0.10 * brightness,   # 3200Hz: 微调(避免推高centroid)
             0.97 + 0.06 * brightness,   # 11025Hz: 接近平坦
         ])
     elif target == "male":
@@ -574,7 +574,7 @@ def _mix_with_original(sp_original: np.ndarray, sp_converted: np.ndarray, target
     strength = _clamp_control(strength)
     n_bins = sp_original.shape[1]
 
-    mix_base = np.linspace(0.82, 0.92, n_bins, dtype=np.float64)
+    mix_base = np.linspace(0.85, 0.91, n_bins, dtype=np.float64)
     mix_ratio = mix_base + strength * 0.06
 
     if target == "female":
