@@ -38,6 +38,11 @@ HTML_PATH = os.path.join(_ROOT, "voice_clarify.html")
 # 训练数据标签映射说明：LabelEncoder按字母序 female→0, male→1
 GENDER_MAP = {"男性": "男性", "女性": "女性", "male": "男性", "female": "女性"}
 
+# 偏置修正阈值：模型倾向男声（男Acc=61.7% vs 女Acc=96.7%），
+# 仅当男声概率超过此阈值才判男性，低于则判女性。
+# 0.50 = 无修正（默认 argmax）；越高越倾向判女性
+MALE_THRESHOLD = 0.50
+
 # 训练数据参考范围（用于调试对比）
 # 格式: (男性mean, 女性mean, 全局min, 全局max)
 TRAINING_REF = {
@@ -257,9 +262,10 @@ def predict_gender_segmented(
     y_for_feature = _ensure_min_duration(y, sr, min_duration=1.2)
     feature_df = extract_audio_features(y_for_feature, sr, feature_names)
     global_proba = model.predict_proba(feature_df.values)[0]
-    global_pred = int(model.predict(feature_df.values)[0])
-    global_gender = "male" if global_pred == 1 else "female"
-    global_conf = float(global_proba.max())
+    prob_male_global = float(global_proba[1])
+    global_gender = "male" if prob_male_global >= MALE_THRESHOLD else "female"
+    # 置信度取判定性别对应的概率，而非盲取 max
+    global_conf = float(prob_male_global if global_gender == "male" else global_proba[0])
 
     # ── 分段投票（用于男女声占比显示） ──
     window_samples = int(window_s * sr)
@@ -280,13 +286,14 @@ def predict_gender_segmented(
                 seg_pad = _ensure_min_duration(seg_trimmed, sr, min_duration=1.0)
                 feats = extract_audio_features(seg_pad, sr, feature_names)
                 proba = model.predict_proba(feats.values)[0]
-                pred = int(model.predict(feats.values)[0])
                 conf = float(proba.max())
+                seg_male_prob = float(proba[1])
                 if conf < 0.55:
                     votes["unknown"] += 1
+                elif seg_male_prob >= MALE_THRESHOLD:
+                    votes["male"] += 1
                 else:
-                    votes["male"] += int(pred == 1)
-                    votes["female"] += int(pred == 0)
+                    votes["female"] += 1
                 segment_probas.append(proba)
                 n_segments += 1
             except Exception:
@@ -301,13 +308,8 @@ def predict_gender_segmented(
         segment_probas.append(global_proba)
 
     # ── 综合置信度 ──
-    valid_votes = votes["male"] + votes["female"]
-    if valid_votes > 0:
-        vote_agree = votes.get("male" if global_gender == "male" else "female", 0)
-        vote_ratio = vote_agree / valid_votes
-        confidence = round(float(global_conf) * (0.5 + 0.5 * vote_ratio) * 100, 1)
-    else:
-        confidence = round(global_conf * 100, 1)
+    # 置信度直接取全局判定性别对应的模型概率，不做分段打折
+    confidence = round(float(global_conf) * 100, 1)
 
     # 无有效段时回退到全局结果
     if n_segments == 0 or (votes["male"] + votes["female"] == 0):
@@ -814,8 +816,9 @@ async def predict_voice(file: UploadFile = File(...)):
         feature_df = extract_audio_features(y_for_feature, sr, feature_names)
 
         raw_proba = model.predict_proba(feature_df)[0]
-        pred_prob = float(raw_proba.max())
-        pred_label = int(model.predict(feature_df)[0])
+        prob_male_web = float(raw_proba[1])
+        pred_label = 1 if prob_male_web >= MALE_THRESHOLD else 0
+        pred_prob = float(prob_male_web if pred_label == 1 else raw_proba[0])
         raw_gender_cn = str(label_mapping.get(pred_label, pred_label))
         predicted_gender = GENDER_MAP.get(raw_gender_cn, raw_gender_cn)
 
